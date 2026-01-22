@@ -25,7 +25,11 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 ### Using `uvx`
 
 ```bash
-uvx mcp-ssh-session
+# From local directory
+uvx --from /path/to/mcp-ssh-session mcp-ssh-session
+
+# From git repository
+uvx --from git+https://github.com/Saifullah336/mcp-ssh-session mcp-ssh-session
 ```
 
 ### Using Claude Code
@@ -38,7 +42,7 @@ Add to your `~/.claude.json`:
     "ssh-session": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["mcp-ssh-session"],
+      "args": ["--from", "git+https://github.com/Saifullah336/mcp-ssh-session", "mcp-ssh-session"],
       "env": {}
     }
   }
@@ -281,6 +285,86 @@ Then simply use:
   "command": "uptime"
 }
 ```
+
+## Environment Variable Override System
+
+**Why**: Hide SSH credentials from AI agents for security.
+
+**How**: Set `OVRD_{host}_*` env vars to override connection parameters. Agent uses fake hostname (e.g., "myserver"), system uses real credentials from env vars.
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `OVRD_{host}_HOST` | Real hostname/IP |
+| `OVRD_{host}_PORT` | SSH port |
+| `OVRD_{host}_USER` | SSH username |
+| `OVRD_{host}_PASS` | SSH password |
+| `OVRD_{host}_KEY` | Path to SSH key |
+| `OVRD_{host}_SUDO_PASS` | Sudo password |
+
+### Usage
+
+```json
+{
+  "mcpServers": {
+    "ssh-session": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-ssh-session"],
+      "env": {
+        "OVRD_myserver_HOST": "192.168.1.100",
+        "OVRD_myserver_USER": "admin",
+        "OVRD_myserver_PASS": "secret123",
+        "OVRD_myserver_SUDO_PASS": "sudopass"
+      }
+    }
+  }
+}
+```
+
+Agent calls:
+```json
+{
+  "host": "myserver",
+  "command": "ls -la"
+}
+```
+
+**Note**: Fully backward compatible. Works without env vars.
+
+## Multi-Session Trick
+
+**Why**: Run multiple independent shell sessions to the same host simultaneously.
+
+**How**: Use different `username` values to create separate sessions. Session key = `username@host:port`.
+
+**Use Cases**:
+- Transfer large files in one shell while monitoring in another
+- Run long-running tasks in background while doing other work
+- Test different configurations simultaneously
+
+```json
+{
+  "host": "myserver",
+  "username": "worker1",
+  "command": "rsync -av /data /backup"
+}
+```
+
+```json
+{
+  "host": "myserver",
+  "username": "worker2",
+  "command": "tail -f /var/log/app.log"
+}
+```
+
+**Note**: Env overrides apply per-host, not per-session. All sessions to same host use same credentials.
+
+## Recent Fixes
+
+- **Sudo Behavior**: Commands only run in sudo mode if they start with "sudo". No implicit auto-prefixing.
 
 ## How It Works
 

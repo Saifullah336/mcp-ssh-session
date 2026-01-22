@@ -133,6 +133,10 @@ class SSHSessionManager:
         )
         resolved_key = key_filename or host_config.get("identityfile", [None])[0]
 
+        # Override from env vars
+        if oh := os.getenv(f"OVRD_{host}_HOST"):
+            resolved_host, resolved_username, resolved_port, resolved_key, password = oh, os.getenv(f"OVRD_{host}_USER", resolved_username), int(os.getenv(f"OVRD_{host}_PORT", resolved_port)), os.getenv(f"OVRD_{host}_KEY", resolved_key), os.getenv(f"OVRD_{host}_PASS", password)
+
         with self._lock:
             if session_key in self._sessions:
                 client = self._sessions[session_key]
@@ -187,7 +191,6 @@ class SSHSessionManager:
             except (
                 paramiko.AuthenticationException,
                 paramiko.SSHException,
-                paramiko.NoValidConnectionsError,
                 OSError,
                 TimeoutError,
             ) as e:
@@ -1068,9 +1071,8 @@ class SSHSessionManager:
         try:
             timeout = min(timeout, self.MAX_COMMAND_TIMEOUT)
 
-            # Ensure command starts with sudo
-            if not command.strip().startswith("sudo"):
-                command = f"sudo {command}"
+            # Command should already start with sudo (checked before calling this function)
+            # No need to auto-prefix
 
             # Get the persistent shell
             shell = self._get_or_create_shell(session_key, client)

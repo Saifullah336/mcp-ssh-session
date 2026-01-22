@@ -1,4 +1,5 @@
 """MCP server for SSH session management."""
+import os
 from typing import Optional
 from fastmcp import FastMCP
 from .session_manager import SSHSessionManager
@@ -34,9 +35,9 @@ def execute_command(
     For network devices (routers, switches), use enable_password to automatically
     enter privileged/enable mode before executing commands.
 
-    For Unix/Linux hosts requiring sudo, use sudo_password to automatically handle
-    the sudo password prompt. The command will be automatically prefixed with 'sudo'
-    if not already present.
+    For Unix/Linux hosts requiring sudo, prefix your command with 'sudo' and provide
+    sudo_password to automatically handle the sudo password prompt. Commands will
+    only be executed in sudo mode if they start with 'sudo'.
 
     Advanced Features:
     - Automatic timeout handling with async transition
@@ -58,6 +59,10 @@ def execute_command(
     """
     logger = session_manager.logger.getChild('tool_execute_command')
     logger.info(f"Executing command on {host}: {command[:100]}...")
+    
+    # Override sudo_password from env var if not provided and command starts with sudo
+    if not sudo_password and command.strip().startswith("sudo"):
+        sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
     
     try:
         stdout, stderr, exit_status = session_manager.execute_command(

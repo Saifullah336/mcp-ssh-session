@@ -175,7 +175,8 @@ class CommandExecutor:
 
             logger.debug(f"[WORKER_EXEC] Executing command for {command_id}")
 
-            if sudo_password:
+            # Only use sudo mode if sudo_password is provided AND command starts with sudo
+            if sudo_password and command.strip().startswith("sudo"):
                 logger.debug(f"Executing as sudo for {command_id}")
                 stdout, stderr, exit_code = self._execute_sudo_command_internal(
                     client, command, sudo_password, timeout
