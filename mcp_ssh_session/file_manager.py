@@ -297,6 +297,97 @@ class FileManager:
         return message, "", 0
 
 
+    def streaming_copy(self, host: str, sources: list[str], destinations: list[str], mode: str,
+                       username: Optional[str] = None, password: Optional[str] = None,
+                       key_filename: Optional[str] = None, port: Optional[int] = None,
+                       make_dirs: bool = False, permissions: Optional[int] = None,
+                       sudo_password: Optional[str] = None, use_sudo: bool = False) -> tuple[str, str, int]:
+        """Stream files between local and remote using cat command."""
+        logger = self.logger.getChild('streaming_copy')
+        
+        if mode not in ("upload", "download"):
+            return "", f"Invalid mode: {mode}", 1
+        
+        if len(sources) != len(destinations):
+            return "", "Sources and destinations must have same length", 1
+        
+        if not sources:
+            return "", "No files to copy", 1
+        
+        if not sudo_password and use_sudo:
+            sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
+        
+        # Check permission once for the entire batch
+        from .validation import check_permission
+        alert = "Upload" if mode == "upload" else "Download"
+        files_list = "\n".join([f"  {src} -> {dst}" for src, dst in zip(sources, destinations)])
+        if not check_permission(host, f"SSH File {alert} Alert", f"{alert} {len(sources)} file(s):\n{files_list}"):
+            return "", "Permission denied by user", 1
+        
+        client = self._session_manager.get_or_create_session(host, username, password, key_filename, port)
+        results = []
+        
+        for i, (src, dst) in enumerate(zip(sources, destinations)):
+            try:
+                if mode == "upload":
+                    # Create directories
+                    if make_dirs:
+                        directory = posixpath.dirname(dst)
+                        if directory and directory != '/':
+                            mkdir_cmd = f"sudo -S mkdir -p {shlex.quote(directory)}" if sudo_password else f"mkdir -p {shlex.quote(directory)}"
+                            stdin, stdout, stderr = client.exec_command(mkdir_cmd)
+                            if sudo_password:
+                                stdin.write(f"{sudo_password}\n")
+                            stdin.close()
+                            exit_mkdir = stdout.channel.recv_exit_status()
+                            if exit_mkdir != 0:
+                                error = stderr.read().decode()
+                                results.append(f"{i+1}. Failed: {error}")
+                                continue
+                
+                    # Upload file using tee (not cat > because redirection happens before sudo)
+                    tee_cmd = f"sudo -S tee {shlex.quote(dst)} > /dev/null" if sudo_password else f"tee {shlex.quote(dst)} > /dev/null"
+                    stdin, stdout, stderr = client.exec_command(tee_cmd)
+                    if sudo_password:
+                        stdin.write(f"{sudo_password}\n")
+                    with open(src, 'rb') as f:
+                        while chunk := f.read(8192):
+                            stdin.write(chunk)
+                    stdin.close()
+                    
+                    # Set permissions
+                    if permissions:
+                        chmod_cmd = f"sudo -S chmod {oct(permissions)[2:]} {shlex.quote(dst)}" if sudo_password else f"chmod {oct(permissions)[2:]} {shlex.quote(dst)}"
+                        stdin, stdout, stderr = client.exec_command(chmod_cmd)
+                        if sudo_password:
+                            stdin.write(f"{sudo_password}\n")
+                        stdin.close()
+                else:
+                    # Download file
+                    cat_cmd = f"sudo -S cat {shlex.quote(src)}" if sudo_password else f"cat {shlex.quote(src)}"
+                    stdin, stdout, stderr = client.exec_command(cat_cmd)
+                    if sudo_password:
+                        stdin.write(f"{sudo_password}\n")
+                    stdin.close()
+                    with open(dst, 'wb') as f:
+                        while chunk := stdout.read(8192):
+                            f.write(chunk)
+                
+                exit_status = stdout.channel.recv_exit_status()
+                if exit_status != 0:
+                    error = stderr.read().decode()
+                    logger.error(f"Transfer failed for {src} -> {dst}: {error}")
+                    results.append(f"{i+1}. Failed: {error}")
+                else:
+                    results.append(f"{i+1}. Success: {src} -> {dst}")
+            except Exception as e:
+                logger.error(f"Exception during transfer: {e}")
+                results.append(f"{i+1}. Failed: {e}")
+        
+        failed = any("Failed" in r for r in results)
+        return "\n".join(results), "Some transfers failed" if failed else "", 1 if failed else 0
+
+
     def _ensure_remote_dirs(self, sftp: paramiko.SFTPClient, remote_dir: str):
         """Ensure remote directory structure exists when writing files."""
         logger = self.logger.getChild('ensure_dirs')

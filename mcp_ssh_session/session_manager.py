@@ -1794,6 +1794,27 @@ class SSHSessionManager:
             use_sudo=use_sudo,
         )
 
+    def streaming_copy(self, host: str, sources: list[str], destinations: list[str], mode: str,
+                       username: Optional[str] = None, password: Optional[str] = None,
+                       key_filename: Optional[str] = None, port: Optional[int] = None,
+                       make_dirs: bool = False, permissions: Optional[int] = None,
+                       sudo_password: Optional[str] = None, use_sudo: bool = False) -> tuple[str, str, int]:
+        """Delegate streaming file copy to FileManager helper."""
+        return self.file_manager.streaming_copy(
+            host=host,
+            sources=sources,
+            destinations=destinations,
+            mode=mode,
+            username=username,
+            password=password,
+            key_filename=key_filename,
+            port=port,
+            make_dirs=make_dirs,
+            permissions=permissions,
+            sudo_password=sudo_password,
+            use_sudo=use_sudo,
+        )
+
     def execute_command(
         self,
         host: str,

@@ -307,6 +307,84 @@ def write_file(
 
 
 @mcp.tool()
+def streaming_copy(
+    host: str,
+    sources: list[str],
+    destinations: list[str],
+    mode: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    key_filename: Optional[str] = None,
+    port: Optional[int] = None,
+    make_dirs: bool = False,
+    permissions: Optional[int] = None,
+    sudo_password: Optional[str] = None,
+    use_sudo: bool = False,
+) -> str:
+    """Stream files between local and remote without loading into memory.
+    
+    Uses tee/cat commands for streaming. Works with all file types including binary.
+    Supports multiple files in a single batch operation.
+    
+    **FILE ATTRIBUTE BEHAVIOR:**
+    - EXISTING FILES: Content is OVERWRITTEN, permissions and owner are PRESERVED
+    - NEW FILES: Created with system defaults (dir: 755, file: 644), owner based on sudo usage
+    - permissions param: Only changes permissions if explicitly provided
+    - Owner: NEVER changed (no chown support)
+    
+    **Args:**
+        host: Hostname, IP address, or SSH config alias
+        sources: List of source paths (local for upload, remote for download)
+        destinations: List of destination paths (remote for upload, local for download)
+        mode: "upload" (local->remote) or "download" (remote->local)
+        username: SSH username (optional)
+        password: SSH password (optional)
+        key_filename: Path to SSH key file (optional)
+        port: SSH port (optional)
+        make_dirs: Create parent directories for upload (default: False)
+        permissions: Set file permissions for upload (e.g., 420 for 0644, default: None)
+        sudo_password: Password for sudo (optional, not needed if NOPASSWD configured)
+        use_sudo: Use sudo for operations (default: False)
+    
+    **Examples:**
+        # Upload single file (preserves existing permissions/owner)
+        streaming_copy(host="server", sources=["/local/file.txt"], destinations=["/remote/file.txt"], mode="upload")
+        
+        # Upload with specific permissions
+        streaming_copy(host="server", sources=["/local/file.txt"], destinations=["/remote/file.txt"], mode="upload", permissions=420)
+        
+        # Download root-owned files with sudo
+        streaming_copy(host="server", sources=["/root/f1.txt"], destinations=["./f1.txt"], mode="download", use_sudo=True)
+    """
+    logger = session_manager.logger.getChild('tool_streaming_copy')
+    logger.info(f"Streaming copy: {mode} {len(sources)} files from/to {host}")
+    
+    message, stderr, exit_status = session_manager.streaming_copy(
+        host=host,
+        sources=sources,
+        destinations=destinations,
+        mode=mode,
+        username=username,
+        password=password,
+        key_filename=key_filename,
+        port=port,
+        make_dirs=make_dirs,
+        permissions=permissions,
+        sudo_password=sudo_password,
+        use_sudo=use_sudo,
+    )
+
+    result = f"Exit Status: {exit_status}\n\n"
+    if message:
+        result += f"RESULTS:\n{message}\n"
+    if stderr:
+        result += f"STDERR:\n{stderr}\n"
+        
+    logger.info(f"Streaming copy finished with exit status {exit_status}.")
+    return result
+
+
+@mcp.tool()
 def execute_command_async(
     host: str,
     command: str,
