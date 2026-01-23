@@ -1078,6 +1078,12 @@ class SSHSessionManager:
             shell = self._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
 
+            # Ask for permission if paranoia mode is enabled
+            from .validation import check_permission
+            host = session_key.split('@')[1].split(':')[0]
+            if not check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?"):
+                return "", "Permission denied by user", 1
+
             # Send the command
             shell.send(command + "\n")
             time.sleep(0.5)
@@ -1595,6 +1601,12 @@ class SSHSessionManager:
             # Get the persistent shell for this session
             shell = self._get_or_create_shell(session_key, client)
             shell.settimeout(timeout)
+
+            # Ask for permission if paranoia mode is enabled
+            from .validation import check_permission
+            host = session_key.split('@')[1].split(':')[0]
+            if not check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?"):
+                return "", "Permission denied by user", 1
 
             # Validate enable mode state if we think we are enabled
             if self._enable_mode.get(session_key, False):
