@@ -53,7 +53,7 @@ Add to your `~/.claude.json`:
 ### Using MCP Inspector
 
 ```bash
-npx @modelcontextprotocol/inspector uvx mcp-ssh-session
+npx @modelcontextprotocol/inspector uvx --from git+https://github.com/Saifullah336/mcp-ssh-session mcp-ssh-session
 ```
 
 ### Development Installation
@@ -312,7 +312,7 @@ Then simply use:
     "ssh-session": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["mcp-ssh-session"],
+      "args": ["--from", "git+https://github.com/Saifullah336/mcp-ssh-session", "mcp-ssh-session"],
       "env": {
         "OVRD_myserver_HOST": "192.168.1.100",
         "OVRD_myserver_USER": "admin",
@@ -334,6 +334,23 @@ Agent calls:
 
 **Note**: Fully backward compatible. Works without env vars.
 
+## Environment File Support
+
+Set `SSH_ENV_FILE` to a `.env` file path to load all configuration at startup. Useful for sharing settings across multiple clients.
+
+```json
+"env": { "SSH_ENV_FILE": "/path/to/ssh.env" }
+```
+
+## SSE Mode
+
+Set `SSE_PORT` to run as standalone HTTP server for network clients (e.g., VSCode extensions). Permission dialogs work since server runs with DISPLAY access.
+
+```bash
+SSE_PORT=8000 uvx --from git+https://github.com/Saifullah336/mcp-ssh-session mcp-ssh-session
+# Connect to: http://localhost:8000/sse
+```
+
 ## Paranoia Mode
 
 **Why**: Require explicit user approval for every SSH operation for maximum security.
@@ -348,7 +365,7 @@ Agent calls:
     "ssh-session": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["mcp-ssh-session"],
+      "args": ["--from", "git+https://github.com/Saifullah336/mcp-ssh-session", "mcp-ssh-session"],
       "env": {
         "myserver_PARANOIA": "1"
       }
