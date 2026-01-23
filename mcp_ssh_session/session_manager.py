@@ -1405,6 +1405,13 @@ class SSHSessionManager:
 
             # Send command without sentinel - rely on prompt detection
             logger.info(f"Executing command on {session_key}: {command}")
+            
+            # Ask for permission if paranoia mode is enabled
+            from .validation import check_permission
+            host = session_key.split('@')[1].split(':')[0]
+            if not check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?"):
+                return "", "Permission denied by user", 1, None
+            
             shell.send(command + "\n")
             time.sleep(0.3)
 

@@ -19,6 +19,7 @@ An MCP (Model Context Protocol) server that enables AI agents to establish and m
 - **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
 - **File Operations**: Safe helpers to read and write remote files over SFTP
 - **Command Interruption**: Send Ctrl+C to interrupt running commands
+- **Paranoia Mode**: Per-host permission dialogs for command/file operations (set `{host}_PARANOIA=1`)
 
 ## Installation
 
@@ -333,6 +334,38 @@ Agent calls:
 
 **Note**: Fully backward compatible. Works without env vars.
 
+## Paranoia Mode
+
+**Why**: Require explicit user approval for every SSH operation for maximum security.
+
+**How**: Set `{host}_PARANOIA=1` env var to enable permission dialogs for commands and file operations.
+
+### Usage
+
+```json
+{
+  "mcpServers": {
+    "ssh-session": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-ssh-session"],
+      "env": {
+        "myserver_PARANOIA": "1"
+      }
+    }
+  }
+}
+```
+
+When enabled, every operation shows a native dialog (zenity on Linux, AppleScript on macOS, native on Windows):
+- Commands: "Execute: {command} on {session_key}?"
+- File reads: "Read file: {path} on {host}?"
+- File writes: "Write file: {path} on {host}?"
+
+Agent receives "Permission denied by user" if cancelled.
+
+**Note**: Requires `xdialog` package (cross-platform wrapper for native dialogs).
+
 ## Multi-Session Trick
 
 **Why**: Run multiple independent shell sessions to the same host simultaneously.
@@ -365,6 +398,7 @@ Agent calls:
 ## Recent Fixes
 
 - **Sudo Behavior**: Commands only run in sudo mode if they start with "sudo". No implicit auto-prefixing.
+- **Paranoia Mode**: Per-host permission dialogs for command/file operations (set `{host}_PARANOIA=1`).
 
 ## How It Works
 

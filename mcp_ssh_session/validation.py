@@ -1,4 +1,5 @@
 """Command validation and output limiting for SSH sessions."""
+import os
 import re
 from typing import Optional, Tuple
 
@@ -61,6 +62,36 @@ class CommandValidator:
                     return False, f"Dangerous command blocked: Matches pattern '{pattern}'. This operation is not allowed for safety."
 
         return True, None
+
+
+def check_permission(host: str, title: str, message: str) -> bool:
+    """
+    Ask for user permission using xdialog (cross-platform native dialogs).
+
+    Paranoia mode is controlled per-host via env var: {host}_PARANOIA=1
+
+    Args:
+        host: SSH host/alias for paranoia mode check
+        title: Dialog title
+        message: Dialog message
+
+    Returns:
+        bool: True if user approves or paranoia mode disabled, False if denied
+    """
+    # Check if paranoia mode is enabled for this host
+    if os.getenv(f"{host}_PARANOIA") != "1":
+        return True
+
+    # Use zenity backend if available, otherwise fallback to default
+    try:
+        import xdialog.zenity_dialogs as zenity
+        result = zenity.okcancel(title=title, message=message)
+        return result == 0  # 0 = OK, 1 = Cancel
+    except Exception:
+        # Fallback to xdialog default
+        import xdialog
+        result = xdialog.okcancel(title=title, message=message)
+        return result == 0  # 0 = OK, 1 = Cancel
 
 
 class OutputLimiter:

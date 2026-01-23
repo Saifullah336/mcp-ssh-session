@@ -49,6 +49,11 @@ class FileManager:
         sftp = None
         permission_denied = False
         try:
+            # Ask for permission if paranoia mode is enabled
+            from .validation import check_permission
+            if not check_permission(host, "SSH File Read Alert", f"Read file: {remote_path} on {host}?"):
+                return "", "Permission denied by user", 1
+            
             logger.debug("Attempting to read file via SFTP.")
             sftp = client.open_sftp()
             attrs = sftp.stat(remote_path)
@@ -188,6 +193,11 @@ class FileManager:
         if not use_sudo and not sudo_password:
             sftp = None
             try:
+                # Ask for permission if paranoia mode is enabled
+                from .validation import check_permission
+                if not check_permission(host, "SSH File Write Alert", f"Write file: {remote_path} on {host}?"):
+                    return "", "Permission denied by user", 1
+                
                 logger.debug("Attempting to write file via SFTP.")
                 sftp = client.open_sftp()
 
