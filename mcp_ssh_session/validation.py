@@ -1,6 +1,7 @@
 """Command validation and output limiting for SSH sessions."""
 import os
 import re
+import tempfile
 from typing import Optional, Tuple
 
 
@@ -64,7 +65,7 @@ class CommandValidator:
         return True, None
 
 
-def check_permission(host: str, title: str, message: str) -> bool:
+def check_permission(host: str, title: str, message: str) -> bool | str:
     """
     Ask for user permission using xdialog (cross-platform native dialogs).
 
@@ -76,22 +77,76 @@ def check_permission(host: str, title: str, message: str) -> bool:
         message: Dialog message
 
     Returns:
-        bool: True if user approves or paranoia mode disabled, False if denied
+        bool | str: True if user approves or paranoia mode disabled, error message string if denied
     """
+    # Find the latest permission file in the known folder
+    permission_dir = os.path.join(tempfile.gettempdir(), "mcp-ssh-permissions")
+    permission_file = None
+    
+    if os.path.exists(permission_dir):
+        try:
+            # Get all files in the directory
+            files = [os.path.join(permission_dir, f) for f in os.listdir(permission_dir) 
+                     if os.path.isfile(os.path.join(permission_dir, f))]
+            if files:
+                # Find the most recently modified file
+                permission_file = max(files, key=os.path.getmtime)
+                # Write waiting status
+                with open(permission_file, 'w') as f:
+                    f.write("waiting")
+        except:
+            pass
+    
     # Check if paranoia mode is enabled for this host
     if os.getenv(f"{host}_PARANOIA") != "1":
+        # Write approved status if permission file exists
+        if permission_file:
+            try:
+                with open(permission_file, 'w') as f:
+                    f.write("approved")
+            except:
+                pass
         return True
 
     # Use zenity backend if available, otherwise fallback to default
     try:
         import xdialog.zenity_dialogs as zenity
         result = zenity.okcancel(title=title, message=message)
-        return result == 0  # 0 = OK, 1 = Cancel
+        approved = result == 0  # 0 = OK, 1 = Cancel
     except Exception:
         # Fallback to xdialog default
         import xdialog
         result = xdialog.okcancel(title=title, message=message)
-        return result == 0  # 0 = OK, 1 = Cancel
+        approved = result == 0  # 0 = OK, 1 = Cancel
+
+    # Write final permission result if permission file exists
+    if permission_file:
+        try:
+            with open(permission_file, 'w') as f:
+                f.write("approved" if approved else "denied")
+        except:
+            pass
+
+    # If denied, check for feedback file
+    if not approved:
+        feedback_file = os.getenv("FEEDBACK_FILE")
+        if feedback_file and os.path.exists(feedback_file):
+            try:
+                with open(feedback_file, 'r') as f:
+                    feedback = f.read().strip()
+                if feedback:
+                    # Clear the feedback file
+                    try:
+                        with open(feedback_file, 'w') as f:
+                            f.write("")
+                    except Exception:
+                        pass  # Ignore errors when clearing
+                    return f"Permission denied by user. user_message:{feedback}"
+            except Exception:
+                pass  # Ignore errors when reading feedback file
+        return "Permission denied by user"
+
+    return approved
 
 
 class OutputLimiter:

@@ -5,6 +5,8 @@ import threading
 import time
 import re
 import logging
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime
@@ -60,7 +62,23 @@ class CommandExecutor:
         last_activity = start
         last_stdout = ""
         last_stderr = ""
+        
+        # Watch for permission file to extend timeout during permission check
+        permission_dir = os.path.join(tempfile.gettempdir(), "mcp-ssh-permissions")
+        permission_file = os.path.join(permission_dir, command_id)
+        
         while time.time() - start < timeout:
+            # Check if waiting for permission and extend timeout
+            if os.path.exists(permission_file):
+                try:
+                    with open(permission_file, 'r') as f:
+                        if f.read().strip() == "waiting":
+                            start = time.time()  # Reset timeout while waiting
+                            time.sleep(0.1)
+                            continue
+                except:
+                    pass
+            
             status = self.get_command_status(command_id)
             poll_count += 1
 
@@ -116,6 +134,14 @@ class CommandExecutor:
 
         command_id = str(uuid.uuid4())
         logger.debug(f"Generated command_id: {command_id}")
+
+        # Create permission file for this command
+        permission_dir = os.path.join(tempfile.gettempdir(), "mcp-ssh-permissions")
+        os.makedirs(permission_dir, exist_ok=True)
+        permission_file = os.path.join(permission_dir, command_id)
+        with open(permission_file, 'w') as f:
+            f.write("")  # Start with empty file
+        logger.debug(f"Created permission file: {permission_file}")
 
         running_cmd = RunningCommand(
             command_id=command_id,
@@ -197,6 +223,15 @@ class CommandExecutor:
                 stdout, stderr, exit_code, awaiting_input_reason = self._execute_standard_command_internal(
                     client, command, timeout, session_key
                 )
+            
+            # Permission check complete, clean up permission file
+            try:
+                permission_dir = os.path.join(tempfile.gettempdir(), "mcp-ssh-permissions")
+                permission_file = os.path.join(permission_dir, command_id)
+                if os.path.exists(permission_file):
+                    os.remove(permission_file)
+            except:
+                pass
 
             logger.debug(f"[WORKER_DONE] command_id={command_id}, exit_code={exit_code}, awaiting_input={awaiting_input_reason}")
 

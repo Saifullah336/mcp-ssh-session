@@ -307,7 +307,7 @@ def write_file(
 
 
 @mcp.tool()
-def streaming_copy(
+def upload_or_download(
     host: str,
     sources: list[str],
     destinations: list[str],
@@ -321,7 +321,7 @@ def streaming_copy(
     sudo_password: Optional[str] = None,
     use_sudo: bool = False,
 ) -> str:
-    """Stream files between local and remote without loading into memory.
+    """Upload or download files between local and remote without loading into memory.
     
     Uses tee/cat commands for streaming. Works with all file types including binary.
     Supports multiple files in a single batch operation.
@@ -348,18 +348,18 @@ def streaming_copy(
     
     **Examples:**
         # Upload single file (preserves existing permissions/owner)
-        streaming_copy(host="server", sources=["/local/file.txt"], destinations=["/remote/file.txt"], mode="upload")
+        upload_or_download(host="server", sources=["/local/file.txt"], destinations=["/remote/file.txt"], mode="upload")
         
         # Upload with specific permissions
-        streaming_copy(host="server", sources=["/local/file.txt"], destinations=["/remote/file.txt"], mode="upload", permissions=420)
+        upload_or_download(host="server", sources=["/local/file.txt"], destinations=["/remote/file.txt"], mode="upload", permissions=420)
         
         # Download root-owned files with sudo
-        streaming_copy(host="server", sources=["/root/f1.txt"], destinations=["./f1.txt"], mode="download", use_sudo=True)
+        upload_or_download(host="server", sources=["/root/f1.txt"], destinations=["./f1.txt"], mode="download", use_sudo=True)
     """
-    logger = session_manager.logger.getChild('tool_streaming_copy')
-    logger.info(f"Streaming copy: {mode} {len(sources)} files from/to {host}")
+    logger = session_manager.logger.getChild('tool_upload_or_download')
+    logger.info(f"Upload or download: {mode} {len(sources)} files from/to {host}")
     
-    message, stderr, exit_status = session_manager.streaming_copy(
+    message, stderr, exit_status = session_manager.upload_or_download(
         host=host,
         sources=sources,
         destinations=destinations,

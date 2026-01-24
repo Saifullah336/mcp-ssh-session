@@ -51,8 +51,9 @@ class FileManager:
         try:
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
-            if not check_permission(host, "SSH File Read Alert", f"Read file: {remote_path} on {host}?"):
-                return "", "Permission denied by user", 1
+            result = check_permission(host, "SSH File Read Alert", f"Read file: {remote_path} on {host}?")
+            if result is not True:
+                return "", result, 1
             
             logger.debug("Attempting to read file via SFTP.")
             sftp = client.open_sftp()
@@ -195,8 +196,9 @@ class FileManager:
             try:
                 # Ask for permission if paranoia mode is enabled
                 from .validation import check_permission
-                if not check_permission(host, "SSH File Write Alert", f"Write file: {remote_path} on {host}?"):
-                    return "", "Permission denied by user", 1
+                result = check_permission(host, "SSH File Write Alert", f"Write file: {remote_path} on {host}?")
+                if result is not True:
+                    return "", result, 1
                 
                 logger.debug("Attempting to write file via SFTP.")
                 sftp = client.open_sftp()
@@ -297,13 +299,13 @@ class FileManager:
         return message, "", 0
 
 
-    def streaming_copy(self, host: str, sources: list[str], destinations: list[str], mode: str,
+    def upload_or_download(self, host: str, sources: list[str], destinations: list[str], mode: str,
                        username: Optional[str] = None, password: Optional[str] = None,
                        key_filename: Optional[str] = None, port: Optional[int] = None,
                        make_dirs: bool = False, permissions: Optional[int] = None,
                        sudo_password: Optional[str] = None, use_sudo: bool = False) -> tuple[str, str, int]:
-        """Stream files between local and remote using cat command."""
-        logger = self.logger.getChild('streaming_copy')
+        """Upload or download files between local and remote using cat command."""
+        logger = self.logger.getChild('upload_or_download')
         
         if mode not in ("upload", "download"):
             return "", f"Invalid mode: {mode}", 1
@@ -321,8 +323,9 @@ class FileManager:
         from .validation import check_permission
         alert = "Upload" if mode == "upload" else "Download"
         files_list = "\n".join([f"  {src} -> {dst}" for src, dst in zip(sources, destinations)])
-        if not check_permission(host, f"SSH File {alert} Alert", f"{alert} {len(sources)} file(s):\n{files_list}"):
-            return "", "Permission denied by user", 1
+        result = check_permission(host, f"SSH File {alert} Alert", f"{alert} {len(sources)} file(s):\n{files_list}")
+        if result is not True:
+            return "", result, 1
         
         client = self._session_manager.get_or_create_session(host, username, password, key_filename, port)
         results = []

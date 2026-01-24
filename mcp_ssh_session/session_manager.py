@@ -1081,8 +1081,9 @@ class SSHSessionManager:
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
             host = session_key.split('@')[1].split(':')[0]
-            if not check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?"):
-                return "", "Permission denied by user", 1
+            result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
+            if result is not True:
+                return "", result, 1
 
             # Send the command
             shell.send(command + "\n")
@@ -1415,8 +1416,9 @@ class SSHSessionManager:
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
             host = session_key.split('@')[1].split(':')[0]
-            if not check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?"):
-                return "", "Permission denied by user", 1, None
+            result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
+            if result is not True:
+                return "", result, 1, None
             
             shell.send(command + "\n")
             time.sleep(0.3)
@@ -1605,8 +1607,9 @@ class SSHSessionManager:
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
             host = session_key.split('@')[1].split(':')[0]
-            if not check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?"):
-                return "", "Permission denied by user", 1
+            result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
+            if result is not True:
+                return "", result, 1
 
             # Validate enable mode state if we think we are enabled
             if self._enable_mode.get(session_key, False):
@@ -1806,13 +1809,13 @@ class SSHSessionManager:
             use_sudo=use_sudo,
         )
 
-    def streaming_copy(self, host: str, sources: list[str], destinations: list[str], mode: str,
+    def upload_or_download(self, host: str, sources: list[str], destinations: list[str], mode: str,
                        username: Optional[str] = None, password: Optional[str] = None,
                        key_filename: Optional[str] = None, port: Optional[int] = None,
                        make_dirs: bool = False, permissions: Optional[int] = None,
                        sudo_password: Optional[str] = None, use_sudo: bool = False) -> tuple[str, str, int]:
-        """Delegate streaming file copy to FileManager helper."""
-        return self.file_manager.streaming_copy(
+        """Delegate file upload or download to FileManager helper."""
+        return self.file_manager.upload_or_download(
             host=host,
             sources=sources,
             destinations=destinations,
