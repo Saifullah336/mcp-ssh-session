@@ -4,6 +4,7 @@ import os
 from typing import Optional
 from fastmcp import FastMCP
 from .session_manager import SSHSessionManager
+from .logging_manager import get_logger
 
 
 # Initialize the MCP server
