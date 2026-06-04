@@ -1,4 +1,5 @@
 """MCP server for SSH session management."""
+import json
 import os
 from typing import Optional
 from fastmcp import FastMCP
@@ -60,9 +61,11 @@ def execute_command(
     logger = session_manager.logger.getChild('tool_execute_command')
     logger.info(f"Executing command on {host}: {command[:100]}...")
     
-    # Override sudo_password from env var if not provided and command starts with sudo
+    # Apply environment variable overrides for credentials
     if not sudo_password and command.strip().startswith("sudo"):
         sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
+    if not enable_password:
+        enable_password = os.getenv(f"OVRD_{host}_ENABLE_PASS")
     
     try:
         stdout, stderr, exit_status = session_manager.execute_command(
@@ -87,9 +90,15 @@ def execute_command(
     # Check if command transitioned to async mode
     if exit_status == 124:
         if stderr.startswith("ASYNC:"):
-            command_id = stderr.split(":", 1)[1]
+            parts = stderr.split(":", 2)
+            command_id = parts[1]
+            reason = parts[2] if len(parts) > 2 else ""
+            if reason == "long_running":
+                headline = "Command started in background because it is likely long-running."
+            else:
+                headline = f"Command exceeded timeout of {timeout}s and is now running in background."
             response = (
-                f"Command exceeded timeout of {timeout}s and is now running in background.\n\n"
+                f"{headline}\n\n"
                 f"Command ID: {command_id}\n\n"
                 f"Use get_command_status('{command_id}') to check progress.\n"
                 f"Use interrupt_command_by_id('{command_id}') to stop it."
@@ -622,4 +631,98 @@ def send_input_by_session(
     
     logger.info(f"Successfully sent input to session {host}.")
     logger.debug(f"Send input by session response:\n{result}")
+    return result
+
+
+@mcp.tool()
+def read_screen(host: str, username: Optional[str] = None, port: Optional[int] = None, max_lines: int = 24) -> str:
+    """Read the terminal screen state for a session.
+    
+    Returns the current screen content from the terminal emulator, including cursor position.
+    Only works when MCP_SSH_INTERACTIVE_MODE=1 is set.
+    
+    Args:
+        host: Hostname, IP address, or SSH config alias
+        username: SSH username (optional, will use SSH config or current user)
+        port: SSH port (optional, will use SSH config or default 22)
+        max_lines: Maximum number of lines to return (default: 24)
+    
+    Returns:
+        JSON string with screen lines, cursor position, and dimensions
+    """
+    logger = get_logger("read_screen")
+    logger.info(f"Reading screen for {host}")
+    
+    _, _, _, _, session_key = session_manager._resolve_connection(host, username, port)
+    snapshot = session_manager._get_screen_snapshot(session_key, max_lines)
+    
+    result = json.dumps(snapshot, indent=2)
+    logger.debug(f"Screen snapshot:\n{result}")
+    return result
+
+
+@mcp.tool()
+def send_keys(host: str, keys: str, username: Optional[str] = None, port: Optional[int] = None) -> str:
+    """Send special keys or key sequences to a session.
+    
+    Supports special key tokens:
+    - <enter> or <return>: Send newline
+    - <esc> or <escape>: Send escape key
+    - <tab>: Send tab key
+    - <ctrl-c>: Send Ctrl+C (interrupt)
+    - <ctrl-d>: Send Ctrl+D (EOF)
+    - <ctrl-z>: Send Ctrl+Z (suspend)
+    - <up>, <down>, <left>, <right>: Arrow keys
+    - <space>: Space character
+    
+    Regular text is sent as-is. Mix special keys with text: "hello<enter>world<ctrl-c>"
+    
+    Args:
+        host: Hostname, IP address, or SSH config alias
+        keys: Key sequence to send (e.g., "q<enter>", "<esc>:wq<enter>", "<ctrl-c>")
+        username: SSH username (optional)
+        port: SSH port (optional)
+    
+    Returns:
+        Success message
+    """
+    logger = get_logger("send_keys")
+    logger.info(f"Sending keys to {host}: {repr(keys)}")
+    
+    # Parse special key tokens
+    key_map = {
+        "<enter>": "\n",
+        "<return>": "\n",
+        "<esc>": "\x1b",
+        "<escape>": "\x1b",
+        "<tab>": "\t",
+        "<ctrl-c>": "\x03",
+        "<ctrl-d>": "\x04",
+        "<ctrl-z>": "\x1a",
+        "<ctrl-g>": "\x07",
+        "<up>": "\x1b[A",
+        "<down>": "\x1b[B",
+        "<right>": "\x1b[C",
+        "<left>": "\x1b[D",
+        "<space>": " ",
+    }
+    
+    # Replace special tokens with actual control characters
+    processed_keys = keys
+    for token, char in key_map.items():
+        processed_keys = processed_keys.replace(token, char)
+    
+    # Send to session
+    success, stdout, stderr = session_manager.send_input_by_session(
+        host, processed_keys, username, port
+    )
+    
+    if success:
+        result = f"Successfully sent keys to {host}"
+        if stdout:
+            result += f"\nOutput: {stdout}"
+    else:
+        result = f"Failed to send keys: {stderr}"
+    
+    logger.debug(f"Send keys result: {result}")
     return result

@@ -1,5 +1,9 @@
 # MCP SSH Session
 
+> [!IMPORTANT]
+> **Alternative version: [mcp-ssh-tmux](https://github.com/devnullvoid/mcp-ssh-tmux)**.
+> Uses `tmux` for improved persistence, observability, and a superior "LLM-as-Observer" approach.
+
 An MCP (Model Context Protocol) server that enables AI agents to establish and manage persistent SSH sessions.
 
 <a href="https://glama.ai/mcp/servers/@devnullvoid/mcp-ssh-session">
@@ -69,17 +73,20 @@ uv pip install -e .
 ### Available Tools
 
 #### `execute_command`
+
 Execute a command on an SSH host using a persistent session.
 
 **Smart Execution**: Starts synchronously and waits for completion. If timeout is reached, automatically transitions to async mode and returns a command ID. Server never hangs!
 
 **Advanced Features**:
+
 - Automatic timeout handling with async transition
 - Interactive command support (use `send_input` for prompts)
 - Command interruption capability (`interrupt_command_by_id`)
 - Session persistence across multiple commands
 
 **Using SSH config alias:**
+
 ```json
 {
   "host": "myserver",
@@ -88,6 +95,7 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 **Using explicit parameters:**
+
 ```json
 {
   "host": "example.com",
@@ -99,6 +107,7 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 **Network device with enable mode:**
+
 ```json
 {
   "host": "router.example.com",
@@ -110,6 +119,7 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 **Unix/Linux with sudo:**
+
 ```json
 {
   "host": "server.example.com",
@@ -120,9 +130,11 @@ Execute a command on an SSH host using a persistent session.
 ```
 
 #### `list_sessions`
+
 List all active SSH sessions.
 
 #### `close_session`
+
 Close a specific SSH session.
 
 ```json
@@ -132,12 +144,15 @@ Close a specific SSH session.
 ```
 
 #### `close_all_sessions`
+
 Close all active SSH sessions.
 
 #### `execute_command_async`
+
 Execute a command asynchronously without blocking the server. Returns a command ID for tracking.
 
 **Use with companion tools**:
+
 - `get_command_status(command_id)` - Check progress and retrieve output
 - `interrupt_command_by_id(command_id)` - Send Ctrl+C to stop execution  
 - `send_input(command_id, text)` - Provide input to interactive commands
@@ -151,6 +166,7 @@ Execute a command asynchronously without blocking the server. Returns a command 
 ```
 
 #### `get_command_status`
+
 Get the status and output of an async command.
 
 ```json
@@ -160,6 +176,7 @@ Get the status and output of an async command.
 ```
 
 #### `interrupt_command_by_id`
+
 Interrupt a running async command by sending Ctrl+C.
 
 ```json
@@ -169,9 +186,11 @@ Interrupt a running async command by sending Ctrl+C.
 ```
 
 #### `list_running_commands`
+
 List all currently running async commands.
 
 #### `list_command_history`
+
 List recent command history (completed, failed, interrupted commands).
 
 ```json
@@ -181,9 +200,11 @@ List recent command history (completed, failed, interrupted commands).
 ```
 
 #### `read_file`
+
 Read the contents of a remote file via SFTP, with optional sudo support.
 
 **Basic usage:**
+
 ```json
 {
   "host": "myserver",
@@ -193,6 +214,7 @@ Read the contents of a remote file via SFTP, with optional sudo support.
 ```
 
 **With passwordless sudo (NOPASSWD in sudoers):**
+
 ```json
 {
   "host": "myserver",
@@ -202,6 +224,7 @@ Read the contents of a remote file via SFTP, with optional sudo support.
 ```
 
 **With sudo password:**
+
 ```json
 {
   "host": "myserver",
@@ -217,9 +240,11 @@ Read the contents of a remote file via SFTP, with optional sudo support.
 - Returns truncated notice when the content size exceeds the requested limit
 
 #### `write_file`
+
 Write text content to a remote file via SFTP, with optional sudo support.
 
 **Basic usage:**
+
 ```json
 {
   "host": "myserver",
@@ -231,6 +256,7 @@ Write text content to a remote file via SFTP, with optional sudo support.
 ```
 
 **With passwordless sudo (NOPASSWD in sudoers):**
+
 ```json
 {
   "host": "myserver",
@@ -242,6 +268,7 @@ Write text content to a remote file via SFTP, with optional sudo support.
 ```
 
 **With sudo password:**
+
 ```json
 {
   "host": "myserver",
@@ -264,6 +291,7 @@ Write text content to a remote file via SFTP, with optional sudo support.
 ## SSH Config Support
 
 The server automatically reads `~/.ssh/config` and supports:
+
 - Host aliases
 - Hostname mappings
 - Port configurations
@@ -271,6 +299,7 @@ The server automatically reads `~/.ssh/config` and supports:
 - IdentityFile settings
 
 Example `~/.ssh/config`:
+
 ```
 Host myserver
     HostName example.com
@@ -280,6 +309,7 @@ Host myserver
 ```
 
 Then simply use:
+
 ```json
 {
   "host": "myserver",
@@ -287,25 +317,27 @@ Then simply use:
 }
 ```
 
-## Environment Variable Override System
+## Environment Variable Override System (Credential Hiding)
 
-**Why**: Hide SSH credentials from AI agents for security.
+For production environments where AI agents should not have access to real credentials, you can use environment variables to override connection parameters. This allows agents to use simple aliases while real credentials are stored securely in the MCP server configuration.
 
-**How**: Set `OVRD_{host}_*` env vars to override connection parameters. Agent uses fake hostname (e.g., "myserver"), system uses real credentials from env vars.
+**Use case:** Hide real hostnames, IPs, usernames, and passwords from AI agents while still allowing them to manage production servers.
 
-### Environment Variables
+### Supported Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `OVRD_{host}_HOST` | Real hostname/IP |
-| `OVRD_{host}_PORT` | SSH port |
-| `OVRD_{host}_USER` | SSH username |
-| `OVRD_{host}_PASS` | SSH password |
-| `OVRD_{host}_KEY` | Path to SSH key |
-| `OVRD_{host}_SUDO_PASS` | Sudo password |
+| `OVRD_{alias}_HOST` | Real hostname or IP address |
+| `OVRD_{alias}_PORT` | SSH port (default: 22) |
+| `OVRD_{alias}_USER` | SSH username |
+| `OVRD_{alias}_PASS` | SSH password |
+| `OVRD_{alias}_KEY` | Path to SSH private key file |
+| `OVRD_{alias}_SUDO_PASS` | Sudo password |
+| `OVRD_{alias}_ENABLE_PASS` | Enable password for network devices (routers/switches) |
 
-### Usage
+### Example Configuration
 
+**Claude Desktop config (`~/.claude.json`):**
 ```json
 {
   "mcpServers": {
@@ -314,25 +346,35 @@ Then simply use:
       "command": "uvx",
       "args": ["--from", "git+https://github.com/Saifullah336/mcp-ssh-session", "mcp-ssh-session"],
       "env": {
-        "OVRD_myserver_HOST": "192.168.1.100",
-        "OVRD_myserver_USER": "admin",
-        "OVRD_myserver_PASS": "secret123",
-        "OVRD_myserver_SUDO_PASS": "sudopass"
+        "OVRD_prod_db_HOST": "192.168.1.100",
+        "OVRD_prod_db_USER": "admin",
+        "OVRD_prod_db_PASS": "secret_password",
+        "OVRD_prod_db_SUDO_PASS": "sudo_password"
       }
     }
   }
 }
 ```
 
-Agent calls:
+**Agent uses the alias (knows nothing about real credentials):**
 ```json
 {
-  "host": "myserver",
-  "command": "ls -la"
+  "host": "prod_db",
+  "command": "systemctl status postgresql"
 }
 ```
 
-**Note**: Fully backward compatible. Works without env vars.
+**System resolves to real credentials:**
+- Host: `prod_db` → `192.168.1.100`
+- User: (from env) → `admin`
+- Password: (from env) → `secret_password`
+
+### Notes
+
+- Fully backward compatible - works without environment variables
+- The agent sees only the alias (`prod_db`), not the real IP
+- Credentials never appear in the AI context
+- Works with all tools: `execute_command`, `read_file`, `write_file`, etc.
 
 ## Environment File Support
 
@@ -420,13 +462,17 @@ Agent receives "Permission denied by user" if cancelled.
 ## How It Works
 
 ### Persistent Shell Sessions
+
 Commands execute in persistent interactive shells that maintain state:
+
 - Current directory persists across commands (`cd /tmp` stays in `/tmp`)
 - Environment variables remain set
 - Shell history is maintained
 
 ### Smart Command Completion Detection
+
 Commands complete when either:
+
 1. **Prompt detected**: Standard shell prompts (`$`, `#`, `>`, `%`) at end of output
 2. **Idle timeout**: No output for 2 seconds after receiving data
 
@@ -442,3 +488,4 @@ Commands complete when either:
 ## License
 
 Distributed under the MIT License. See `LICENSE` for details.
+

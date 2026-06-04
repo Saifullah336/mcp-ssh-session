@@ -12,6 +12,13 @@ from typing import Any, Dict, Optional, Tuple
 
 import paramiko
 
+try:
+    NoValidConnectionsError = paramiko.NoValidConnectionsError  # Paramiko <4.0
+except AttributeError:  # Paramiko 4.x moved it
+    from paramiko.ssh_exception import NoValidConnectionsError  # type: ignore
+
+import pyte
+
 from .command_executor import CommandExecutor
 from .datastructures import CommandStatus
 from .file_manager import FileManager
@@ -65,6 +72,19 @@ class SSHSessionManager:
             str, float
         ] = {}  # Track last log time for rate limiting
 
+        # Terminal emulator support (enabled by default in v0.2.0+)
+        self._interactive_mode = os.environ.get("MCP_SSH_INTERACTIVE_MODE", "1") == "1"
+        self._pty_aware_validation = (
+            os.environ.get("MCP_SSH_PTY_AWARE_VALIDATION", "0") == "1"
+        )
+        self._mikrotik_auto_without_paging = (
+            os.environ.get("MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING", "1") == "1"
+        )
+        self._session_emulators: Dict[str, Tuple[pyte.Screen, pyte.Stream]] = {}
+        self._session_modes: Dict[
+            str, str
+        ] = {}  # Track mode: editor, pager, shell, password_prompt, unknown
+
         # Setup optimized logging
         self.logger = get_logger("ssh_session")
         self.context_logger = get_context_logger("ssh_session")
@@ -75,27 +95,194 @@ class SSHSessionManager:
         self.session_diagnostics = SessionDiagnostics(self)
         self.connection_profiles = ConnectionProfileManager(self)
 
+        if self._interactive_mode:
+            self.logger.info("Interactive PTY mode enabled")
+        if self._pty_aware_validation:
+            self.logger.info(
+                "PTY-aware command validation enabled (MCP_SSH_PTY_AWARE_VALIDATION=1)"
+            )
+        if self._mikrotik_auto_without_paging:
+            self.logger.info(
+                "MikroTik auto without-paging enabled (MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING=1)"
+            )
         self.logger.info("SSHSessionManager initialized")
 
         self.command_executor = CommandExecutor(self)
         self.file_manager = FileManager(self)
 
-    def _log_debug_rate_limited(self, key: str, msg: str, interval: float = 5.0):
+    def _feed_emulator(self, session_key: str, data: str) -> None:
+        """Feed data to terminal emulator if interactive mode is enabled."""
+        if self._interactive_mode and session_key in self._session_emulators:
+            _, stream = self._session_emulators[session_key]
+            stream.feed(data)
+            # Update mode after feeding
+            self._infer_mode_from_screen(session_key)
+
+    def _infer_mode_from_screen(self, session_key: str) -> str:
+        """Infer the current mode from screen content.
+
+        Returns:
+            Mode string: 'editor', 'pager', 'password_prompt', 'shell', or 'unknown'
+        """
+        if not self._interactive_mode or session_key not in self._session_emulators:
+            return "unknown"
+
+        screen, _ = self._session_emulators[session_key]
+
+        # Get screen content
+        lines = []
+        for y in range(screen.lines):
+            line = screen.display[y].rstrip()
+            if line:
+                lines.append(line)
+
+        if not lines:
+            mode = "unknown"
+        else:
+            last_line = lines[-1] if lines else ""
+            screen_text = "\n".join(lines)
+
+            # Check for editor (vim, nano)
+            # Vim: status line with -- INSERT --, -- VISUAL --, or many ~ lines at the start of lines
+            if any(
+                marker in screen_text
+                for marker in ["-- INSERT --", "-- VISUAL --", "-- REPLACE --"]
+            ):
+                mode = "editor"
+            elif screen_text.count("~") > 5 and any(
+                line.lstrip().startswith("~") for line in lines[-10:]
+            ):
+                # Many tildes at the start of lines in last 10 lines suggests vim
+                mode = "editor"
+            elif "GNU nano" in screen_text or "^G Get Help" in screen_text:
+                mode = "editor"
+            # Check for pager (less, more)
+            elif "(END)" in last_line or last_line.strip() == ":":
+                mode = "pager"
+            elif "--More--" in last_line or "-- [Q quit|D dump" in last_line:
+                mode = "pager"
+            # Check for password prompt
+            elif re.search(r'password[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
+                mode = "password_prompt"
+            elif re.search(r'passphrase[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
+                mode = "password_prompt"
+            # Check for shell prompt (has prompt pattern)
+            elif session_key in self._session_prompts:
+                prompt = self._session_prompts[session_key]
+                # Handle wildcard prompts
+                if "*" in prompt or "[" in prompt:
+                    # Convert wildcard to regex
+                    pattern_str = re.escape(prompt).replace(r"\*", ".*?")
+                    pattern_str = pattern_str.replace(r"\[>#\]", "[>#]").replace(
+                        r"\[\$#\]", "[$#]"
+                    )
+                    if re.search(pattern_str + r"\s*$", last_line):
+                        mode = "shell"
+                    else:
+                        mode = "unknown"
+                elif last_line.endswith(prompt.rstrip()):
+                    mode = "shell"
+                else:
+                    mode = "unknown"
+            else:
+                mode = "unknown"
+
+        # Store the mode
+        self._session_modes[session_key] = mode
+        return mode
+
+    def _get_screen_snapshot(self, session_key: str, max_lines: int = 24) -> dict:
+        """Get a snapshot of the terminal screen state.
+
+        Returns:
+            dict with keys: lines (list of strings), cursor_x, cursor_y, width, height
+        """
+        if not self._interactive_mode or session_key not in self._session_emulators:
+            return {
+                "error": "Interactive mode not enabled or session not found",
+                "lines": [],
+                "cursor_x": 0,
+                "cursor_y": 0,
+                "width": 0,
+                "height": 0,
+            }
+
+        screen, _ = self._session_emulators[session_key]
+
+        # Get screen lines (pyte stores them as a dict keyed by line number)
+        lines = []
+        for y in range(min(max_lines, screen.lines)):
+            line = screen.display[y]
+            lines.append(line.rstrip())
+
+        return {
+            "lines": lines,
+            "cursor_x": screen.cursor.x,
+            "cursor_y": screen.cursor.y,
+            "width": screen.columns,
+            "height": screen.lines,
+        }
+
+    def _log_debug_rate_limited(
+        self, logger: logging.Logger, key: str, msg: str, interval: float = 5.0
+    ):
         """Log a debug message only if enough time has passed since last log with this key."""
-        self.logger.debug(msg, key)
+        now = time.time()
+        last_time = self._log_rate_limits.get(key, 0.0)
+        if now - last_time >= interval:
+            self._log_rate_limits[key] = now
+            logger.debug(msg)
 
     def _resolve_connection(
         self, host: str, username: Optional[str], port: Optional[int]
     ) -> tuple[Dict[str, Any], str, str, int, str]:
-        """Resolve SSH connection parameters using config precedence."""
+        """Resolve SSH connection parameters using config precedence.
+        
+        Environment variable overrides (prefix with OVRD_{host}_):
+        - HOST: Override hostname
+        - USER: Override username  
+        - PORT: Override port
+        - KEY: Override key file path
+        - PASS: Override password
+        - SUDO_PASS: Override sudo password
+        - ENABLE_PASS: Override enable password (for network devices)
+        """
         host_config = self._ssh_config.lookup(host)
         resolved_host = host_config.get("hostname", host)
         resolved_username = username or host_config.get(
             "user", os.getenv("USER", "root")
         )
         resolved_port = port or int(host_config.get("port", 22))
+        
+        # Apply environment variable overrides
+        env_prefix = f"OVRD_{host}_"
+        if override_host := os.getenv(f"{env_prefix}HOST"):
+            resolved_host = override_host
+        if override_user := os.getenv(f"{env_prefix}USER"):
+            resolved_username = override_user
+        if port_str := os.getenv(f"{env_prefix}PORT"):
+            try:
+                resolved_port = int(port_str)
+            except ValueError:
+                self.logger.warning(f"Invalid port in {env_prefix}PORT: {port_str}")
+        
         session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
         return host_config, resolved_host, resolved_username, resolved_port, session_key
+    
+    def _get_env_override(
+        self, host: str, param: str, default: Optional[str] = None
+    ) -> Optional[str]:
+        """Get environment variable override for a host parameter.
+        
+        Args:
+            host: The host alias/name used in the tool call
+            param: The parameter name (e.g., 'PASS', 'KEY', 'SUDO_PASS')
+            default: Default value if env var is not set
+            
+        Returns:
+            The override value from environment variable or default
+        """
+        return os.getenv(f"OVRD_{host}_{param}", default)
 
     def _load_ssh_config(self) -> paramiko.SSHConfig:
         """Load SSH config from default locations."""
@@ -132,6 +319,12 @@ class SSHSessionManager:
             self._resolve_connection(host, username, port)
         )
         resolved_key = key_filename or host_config.get("identityfile", [None])[0]
+        
+        # Apply environment variable overrides for credentials
+        if env_key := self._get_env_override(host, "KEY"):
+            resolved_key = env_key
+        if env_pass := self._get_env_override(host, "PASS"):
+            password = env_pass
 
         # Override from env vars
         if oh := os.getenv(f"OVRD_{host}_HOST"):
@@ -191,6 +384,7 @@ class SSHSessionManager:
             except (
                 paramiko.AuthenticationException,
                 paramiko.SSHException,
+                NoValidConnectionsError,
                 OSError,
                 TimeoutError,
             ) as e:
@@ -480,10 +674,30 @@ class SSHSessionManager:
         shell = client.invoke_shell()
         shell.resize_pty(width=100, height=24)
 
-        time.sleep(1)  # Give shell time to initialize
+        # Create terminal emulator if interactive mode is enabled
+        if self._interactive_mode:
+            screen = pyte.Screen(100, 24)
+            stream = pyte.Stream(screen)
+            self._session_emulators[session_key] = (screen, stream)
+            logger.debug(f"Created terminal emulator for {session_key}")
+
+        time.sleep(2)  # Give shell time to initialize
         initial_output = ""
-        if shell.recv_ready():
-            initial_output = shell.recv(4096).decode("utf-8", errors="ignore")
+        # Wait up to 5 seconds for initial output/banner (some routers are slow)
+        start_wait = time.time()
+        while time.time() - start_wait < 5.0:
+            if shell.recv_ready():
+                chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                logger.debug(f"Initial shell output chunk: {repr(chunk)}")
+                initial_output += chunk
+                # Feed to emulator if enabled
+                if self._interactive_mode and session_key in self._session_emulators:
+                    _, stream = self._session_emulators[session_key]
+                    stream.feed(chunk)
+            elif initial_output and (time.time() - start_wait > 1.0):
+                # We got some output and it's quiet, maybe it's done
+                break
+            time.sleep(0.2)
 
         self._session_shells[session_key] = shell
 
@@ -658,19 +872,22 @@ class SSHSessionManager:
 
                 if shell.recv_ready():
                     output = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Capture prompt received: {repr(output)}")
             else:
                 # Unix/Linux shells: try echo with marker
+                # Use leading space to avoid history pollution
                 marker = f"__MCP_PROMPT_MARKER_{uuid.uuid4().hex[:8]}__"
-                shell.send(f'echo "{marker}"\n')
+                shell.send(f' echo "{marker}"\n')
                 time.sleep(0.5)
 
                 # Collect output
                 start_time = time.time()
-                timeout = 3.0
+                timeout = 10.0
 
                 while time.time() - start_time < timeout:
                     if shell.recv_ready():
                         chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                        logger.debug(f"Capture prompt received chunk: {repr(chunk)}")
                         output += chunk
 
                         # Check if we've received the marker and subsequent prompt
@@ -692,10 +909,41 @@ class SSHSessionManager:
                     )
                     # Try simple newline approach
                     shell.send("\n")
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                     if shell.recv_ready():
-                        output = shell.recv(4096).decode("utf-8", errors="ignore")
+                        fallback_output = shell.recv(4096).decode(
+                            "utf-8", errors="ignore"
+                        )
+                        logger.debug(
+                            f"Capture prompt fallback received: {repr(fallback_output)}"
+                        )
+                        output += fallback_output
                         marker = None  # Disable marker processing
+
+                    # Check if we can identify the device type from the accumulated output
+                    output_lower = output.lower()
+                    if (
+                        "mikrotik" in output_lower
+                        or "routeros" in output_lower
+                        or re.search(r"\[.+@.+\]\s*>", output)
+                    ):
+                        logger.info(
+                            f"Detected MikroTik device from fallback output for {session_key}"
+                        )
+                        self._session_shell_types[session_key] = "mikrotik"
+                    elif "edgeswitch" in output_lower or "ubiquiti" in output_lower:
+                        self._session_shell_types[session_key] = "edgeswitch"
+                    elif any(c in output_lower for c in ["cisco", "ios", ">", "#"]):
+                        # Very basic check for other network devices
+                        if not any(s in output_lower for s in ["bash", "zsh", "fish"]):
+                            logger.info(
+                                f"Suspect network device for {session_key} based on prompt/output"
+                            )
+                            # Don't set to mikrotik, but maybe generic network_device
+                            if device_type == "unknown":
+                                self._session_shell_types[session_key] = (
+                                    "network_device"
+                                )
 
             if not output:
                 logger.warning(f"No output received for {session_key}")
@@ -746,6 +994,7 @@ class SSHSessionManager:
         Makes prompts flexible for:
         - Directory changes: [user@host ~/dir]$ -> [user@host *]$
         - Path changes: user@host:/path$ -> user@host:*$
+        - MikroTik submenus: [user@host] /ip> -> [user@host] *>
 
         Args:
             prompt: The literal captured prompt
@@ -756,23 +1005,26 @@ class SSHSessionManager:
         """
         original = prompt
 
-        # Pattern 1: [user@host directory]$ or [user@host directory]#
-        # Generalize: [user@host *]$ or [user@host *]#
+        # Pattern 1: [user@host] path> (MikroTik style)
+        if "[" in prompt and "]" in prompt and "@" in prompt:
+            # Match bracketed part and whatever follows until prompt char
+            match = re.search(r"^(\[[^\]]*@[^\]]*\]).*?([>#\$%]\s*)$", prompt)
+            if match:
+                return match.group(1) + "*" + match.group(2)
+
+        # Pattern 2: [user@host directory]$ or [user@host directory]# (Standard Unix style)
         if "[" in prompt and "]" in prompt and ("@" in prompt or " " in prompt):
-            # Replace content between last space/@ and ] with *
-            # Match [anything] followed by prompt char
             match = re.search(r"(\[[^\]]*[@\s][^\]]*)\]([>#\$%])", prompt)
             if match:
                 # Find the last space or path separator in the bracket
                 bracket_content = match.group(1)
                 prompt_char = match.group(2)
-                # Replace everything after last space with *
                 if " " in bracket_content:
                     parts = bracket_content.rsplit(" ", 1)
-                    generalized = parts[0] + " *]" + prompt_char
-                    return generalized
+                    return parts[0] + " *]" + prompt_char
+                return bracket_content + "]" + prompt_char
 
-        # Pattern 2: user@host:/path$ or user@host:~$ or user@host:~/path$
+        # Pattern 3: user@host:/path$ or user@host:~$ or user@host:~/path$
         # Generalize: user@host:*$ or user@host:*#
         if ":" in prompt and "@" in prompt:
             # Replace path after : with *
@@ -793,7 +1045,7 @@ class SSHSessionManager:
                         generalized = parts[0] + ":*" + prompt_char
                         return generalized
 
-        # Pattern 3: user@host directory$ or user@host directory#
+        # Pattern 4: user@host directory$ or user@host directory#
         # Generalize: user@host *$ or user@host *#
         if "@" in prompt and " " in prompt:
             match = re.search(r"(@[^\s]+\s+)(.+)([>#\$%]\s*)$", prompt)
@@ -804,16 +1056,6 @@ class SSHSessionManager:
                 user_part = prompt.split("@")[0]
                 generalized = user_part + prefix + "*" + prompt_char
                 return generalized
-
-        # Pattern 4: Simple prompts with just directory before prompt char
-        # ~/dir$ -> *$ or /path$ -> *$
-        # DISABLED: Too dangerous, matches any output ending in prompt char
-        # if not '@' in prompt and re.search(r'[~/][^\s]*([>#\$%]\s*)$', prompt):
-        #     match = re.search(r'^(.*/)?[^/\s]+([>#\$%]\s*)$', prompt)
-        #     if match:
-        #         prompt_char = match.group(2)
-        #         generalized = '*' + prompt_char
-        #         return generalized
 
         # No generalization needed
         return prompt
@@ -856,6 +1098,20 @@ class SSHSessionManager:
             # Fish prompts typically have context before the prompt character
             pattern = re.compile(r"(\S+\s+)?[>#\$]\s*$")
             logger.debug("Using Fish shell prompt pattern")
+        elif shell_type in (
+            "cisco",
+            "juniper",
+            "fortinet",
+            "arista",
+            "paloalto",
+            "checkpoint",
+            "mikrotik",
+            "edgeswitch",
+            "vyos",
+            "openwrt",
+            "network_device",
+        ):
+            logger.debug(f"Skipping PS1 check for network device type: {shell_type}")
         else:
             # Try to read $PS1 from interactive shell (preferred) or exec_command (fallback)
             if shell:
@@ -1019,15 +1275,75 @@ class SSHSessionManager:
         lower = shell_path.lower()
         if "fish" in lower:
             return (
-                "set -l __mcp_status $status; "
+                " set -l __mcp_status $status; "
                 f"printf '\\n{marker}%d\\n' $__mcp_status\n"
             )
         if lower.endswith("csh") or "tcsh" in lower:
-            return f'set __mcp_status=$status; echo "{marker}$__mcp_status"\n'
+            return f' set __mcp_status=$status; echo "{marker}$__mcp_status"\n'
         return (
-            "__mcp_status=$?; "
+            " __mcp_status=$?; "
             f'printf \'\\n{marker}%d\\n\' "$__mcp_status" 2>/dev/null || echo "{marker}$__mcp_status"\n'
         )
+
+    def _build_command_with_sentinel(
+        self, command: str, marker: str, shell_path: str = ""
+    ) -> str:
+        """Build command text with trailing sentinel in a heredoc-safe form."""
+        sentinel_command = self._build_sentinel_command(marker, shell_path)
+        return f"{command}\n{sentinel_command}"
+
+    def _strip_sentinel(self, output: str, sentinel: Optional[str]) -> str:
+        """Strip the sentinel command and marker from output if present."""
+        if not sentinel or sentinel not in output:
+            return output
+
+        # Strip the entire sentinel command block if it's visible
+        # It typically looks like: __mcp_status=$?; printf '\nMARKER%d\n' ...
+        # Or it might be partially visible.
+        
+        # First, try to find the start of the sentinel command
+        # We look for the assignment to __mcp_status which is the start of our sentinel block
+        sentinel_start = output.find("__mcp_status=$?")
+        if sentinel_start != -1:
+            return output[:sentinel_start].rstrip()
+            
+        # Fallback: if we only see the marker string itself
+        marker_start = output.find(sentinel)
+        if marker_start != -1:
+            return output[:marker_start].rstrip()
+            
+        return output
+
+    def _maybe_rewrite_mikrotik_command(self, session_key: str, command: str) -> str:
+        """Append MikroTik 'without-paging' for print commands when safe."""
+        if not self._mikrotik_auto_without_paging:
+            return command
+
+        if self._session_shell_types.get(session_key) != "mikrotik":
+            return command
+
+        # Avoid rewriting multiline/script commands.
+        if "\n" in command:
+            return command
+
+        if re.search(r"(^|\s)without-paging(\s|$)", command, re.IGNORECASE):
+            return command
+
+        if not re.search(r"(^|\s)print(\s|$)", command, re.IGNORECASE):
+            return command
+
+        command_starts_with_slash = command.lstrip().startswith("/")
+        prompt = self._session_prompts.get(session_key, "")
+        menu_context = bool(re.search(r"\]\s+/[^>\s]*>\s*$", prompt))
+
+        if not (command_starts_with_slash or menu_context):
+            return command
+
+        rewritten = f"{command.rstrip()} without-paging"
+        self.logger.debug(
+            f"Rewrote MikroTik print command to include without-paging: {rewritten}"
+        )
+        return rewritten
 
     def _execute_with_thread_timeout(
         self, func, timeout: int, *args, **kwargs
@@ -1101,6 +1417,8 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Received chunk: {repr(chunk)}")
+                    self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     idle_check_count = 0  # Reset idle check counter on new data
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
@@ -1219,6 +1537,16 @@ class SSHSessionManager:
         if session_key in self._session_prompts:
             literal_prompt = self._session_prompts[session_key]
 
+            # Optimization: Only check the end of the output for prompt match
+            # Most prompts are on the last line or within a few hundred chars.
+            # 4096 is more than enough context even for complex multi-line prompts.
+            if len(clean_output) > 4096:
+                check_buffer = clean_output[-4096:].rstrip()
+                buffer_offset = len(clean_output) - 4096
+            else:
+                check_buffer = clean_output.rstrip()
+                buffer_offset = 0
+
             # Check if prompt contains wildcards or character classes (generalized)
             if "*" in literal_prompt or "[" in literal_prompt:
                 # Convert to pattern for wildcard matching
@@ -1233,21 +1561,19 @@ class SSHSessionManager:
                 pattern = re.compile(re.escape("").join([pattern_str, r"\s*$"]))
 
                 # Debug: show what we're matching against
-                last_100 = (
-                    clean_output.rstrip()[-100:]
-                    if len(clean_output) > 100
-                    else clean_output.rstrip()
-                )
+                last_100 = check_buffer[-100:] if len(check_buffer) > 100 else check_buffer
                 self._log_debug_rate_limited(
                     logger,
                     f"{session_key}_prompt_check",
                     f"Checking wildcard pattern '{literal_prompt}' (regex: '{pattern.pattern}') against last 100 chars: {repr(last_100)}",
                 )
 
-                match = pattern.search(clean_output.rstrip())
+                match = pattern.search(check_buffer)
                 if match:
                     # Remove the matched prompt from output
-                    output = clean_output[: match.start()].rstrip()
+                    # We need to use the full clean_output for the final result
+                    final_match_pos = buffer_offset + match.start()
+                    output = clean_output[:final_match_pos].rstrip()
                     logger.debug(
                         f"Wildcard pattern matched! Matched text: {repr(match.group())}"
                     )
@@ -1260,7 +1586,7 @@ class SSHSessionManager:
                     )
             else:
                 # Exact literal match
-                if clean_output.rstrip().endswith(literal_prompt):
+                if check_buffer.endswith(literal_prompt):
                     # Remove the prompt from output
                     output = clean_output.rstrip()
                     if output.endswith(literal_prompt):
@@ -1271,9 +1597,20 @@ class SSHSessionManager:
         if session_key in self._session_prompt_patterns:
             prompt_pattern = self._session_prompt_patterns[session_key]
 
-            if prompt_pattern.search(clean_output):
-                output = prompt_pattern.sub("", clean_output).rstrip()
+            # Only check the end of clean_output
+            if len(clean_output) > 4096:
+                check_buffer = clean_output[-4096:]
+                buffer_offset = len(clean_output) - 4096
+            else:
+                check_buffer = clean_output
+                buffer_offset = 0
+
+            match = prompt_pattern.search(check_buffer)
+            if match:
+                final_match_pos = buffer_offset + match.start()
+                output = clean_output[:final_match_pos].rstrip()
                 return True, output
+
 
         return False, clean_output
 
@@ -1285,33 +1622,63 @@ class SSHSessionManager:
         Returns string describing what input is needed, or None if not awaiting input.
         """
         logger = self.logger.getChild("awaiting_input")
-        last_100 = output[-100:] if len(output) > 100 else output
+
+        # Mode-aware gating (only when interactive mode is enabled)
+        if self._interactive_mode and session_key in self._session_modes:
+            mode = self._session_modes.get(session_key, "unknown")
+
+            # If in editor mode, don't flag as awaiting input
+            # Editors handle their own input and shouldn't be interrupted
+            if mode == "editor":
+                self._log_debug_rate_limited(
+                    logger,
+                    f"{session_key}_editor_skip_awaiting",
+                    "In editor mode, skipping awaiting_input detection",
+                )
+                return None
+
+            # For pager mode, allow pager detection to proceed
+            # For shell/password_prompt/unknown, use normal detection
+
+        # Only process the last 4096 characters of output to avoid O(N^2) performance issues
+        # with very large output buffers (like long-running command output).
+        # Most prompts and input requests appear at the very end of the output.
+        if len(output) > 4096:
+            output_to_check = output[-4096:]
+        else:
+            output_to_check = output
+
+        last_100 = output_to_check[-100:] if len(output_to_check) > 100 else output_to_check
         self._log_debug_rate_limited(
             logger,
             f"{session_key}_awaiting_input",
             f"Checking for awaiting input, last 100 chars: {repr(last_100)}",
         )
 
+        clean_output = self._strip_ansi(output_to_check)
+        lines = [line for line in clean_output.splitlines() if line.strip()]
+        last_line = lines[-1].strip() if lines else ""
+
         # Common password prompts - match various formats like "password:", "password for user:", etc.
         # Note: We do NOT use re.MULTILINE so $ matches only the end of the string
         # We also exclude newlines, =, ", and ' from the wildcard to prevent matching
         # across lines, URL parameters, or JSON keys
-        if re.search(r'password[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
+        if re.search(r'password[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
             logger.debug("Detected password prompt")
             return "password"
-        if re.search(r'passphrase[^:=\n"\']*:?\s*$', output, re.IGNORECASE):
+        if re.search(r'passphrase[^:=\n"\']*:?\s*$', last_line, re.IGNORECASE):
             logger.debug("Detected passphrase prompt")
             return "passphrase"
 
         # Pager prompts (less, more, MikroTik)
         # Match (END) with optional line numbers before it, or : on the last line
         # Strip ANSI codes from the end to properly detect pager prompts
-        clean_output = self._strip_ansi(output)
         if re.search(r"(?:^|[\r\n]).*?\(END\)\s*$", clean_output):
             logger.debug("Detected pager (END) prompt")
             return "pager"
-        if re.search(r"(?:^|[\r\n])\s*:\s*$", clean_output):
-            logger.debug("Detected pager : prompt")
+        if last_line == ":":
+            # Common pager prompt when less/most waits for input
+            logger.debug("Detected pager ':' prompt")
             return "pager"
 
         # MikroTik pager prompt
@@ -1329,7 +1696,7 @@ class SSHSessionManager:
         # Yes/no prompts
         if re.search(
             r"\(y/n\)[:\s]*$|\(yes/no\)[:\s]*$|\[y/N\][:\s]*$|\[Y/n\][:\s]*$",
-            output,
+            last_line,
             re.IGNORECASE,
         ):
             return "yes_no"
@@ -1337,13 +1704,18 @@ class SSHSessionManager:
         # Press any key / continue
         if re.search(
             r"(?:press any key|press enter|to continue)[:\.]*\s*$",
-            output,
+            last_line,
             re.IGNORECASE,
         ):
             return "press_key"
 
         # Generic prompt at end (anything ending with ? or prompt-like)
-        if re.search(r"(?:\?|-->|enter [a-z\s]+[:\s]*)$", output, re.IGNORECASE):
+        if last_line.endswith("?") and len(last_line) <= 80 and "|" not in last_line:
+            if not re.search(
+                r"https?://|\bselect\b|\bfrom\b", last_line, re.IGNORECASE
+            ):
+                return "user_input"
+        if re.search(r"\benter\b[^:]{0,80}:\s*$", last_line, re.IGNORECASE):
             return "user_input"
 
         return None
@@ -1380,6 +1752,8 @@ class SSHSessionManager:
             r"^screen\b",  # screen
             r"^tmux\b",  # tmux
             r"^(bash|sh|zsh|fish|ksh|csh|tcsh)\s*$",  # spawning new shell
+            r"^/\.?\.\b",  # MikroTik menu up (/.. or /.)
+            r"^/[a-z-]+(\s+[a-z-]+)*$",  # MikroTik menu change (/ip, /interface bridge, etc.)
         ]
 
         for pattern in context_changers:
@@ -1390,13 +1764,15 @@ class SSHSessionManager:
 
     def _execute_standard_command_internal(
         self, client: paramiko.SSHClient, command: str, timeout: int, session_key: str
-    ) -> tuple[str, str, int, Optional[str]]:
+    ) -> tuple[str, str, int, Optional[str], Optional[str]]:
         """Execute command with natural completion detection and interactive prompt detection.
 
-        Returns: (stdout, stderr, exit_code, awaiting_input_reason)
+        Returns: (stdout, stderr, exit_code, awaiting_input_reason, sentinel)
         - awaiting_input_reason is None if complete, or a string describing what input is needed
+        - sentinel is the marker string used for Unix completion, or None
         """
         logger = self.logger.getChild("standard_command")
+        command = self._maybe_rewrite_mikrotik_command(session_key, command)
 
         # Check if this command will change the shell context
         context_changing = self._is_context_changing_command(command)
@@ -1410,7 +1786,30 @@ class SSHSessionManager:
             with self._lock:
                 self._active_commands[session_key] = shell
 
-            # Send command without sentinel - rely on prompt detection
+            # Clear any pending output to avoid matching stale prompts
+            if shell.recv_ready():
+                try:
+                    while shell.recv_ready():
+                        shell.recv(4096)
+                except Exception:
+                    pass
+
+            # Check shell type to decide on sentinel usage
+            shell_type = self._session_shell_types.get(session_key, "unknown")
+            logger.debug(f"Shell type for {session_key}: {shell_type}")
+            is_unix = shell_type == "unix_shell"
+
+            # Use sentinel only for Unix-like shells and non-interactive commands
+            sentinel = None
+            command_to_send = command
+            # Skip sentinel if command appears to read from stdin (like 'read' command)
+            is_interactive_cmd = re.search(r"\bread\b", command)
+            if is_unix and not is_interactive_cmd:
+                marker = f"__MCP_CMD_{uuid.uuid4().hex[:8]}__"
+                command_to_send = self._build_command_with_sentinel(command, marker, "")
+                sentinel = marker
+                logger.debug(f"Using sentinel marker: {sentinel}")
+
             logger.info(f"Executing command on {session_key}: {command}")
             
             # Ask for permission if paranoia mode is enabled
@@ -1419,65 +1818,226 @@ class SSHSessionManager:
             result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
             if result is not True:
                 return "", result, 1, None
-            
-            shell.send(command + "\n")
+
+            shell.send(command_to_send + "\n")
             time.sleep(0.3)
 
             output_limiter = OutputLimiter()
             raw_output = ""
             start_time = time.time()
             last_recv_time = start_time
-            idle_timeout = 2.0
+
+            # Package managers need longer idle timeout due to database operations
+            command_lower = command.lower().strip()
+            is_package_manager = any(
+                [
+                    re.search(
+                        r"\bpkg\s+(install|upgrade|update|remove|delete)", command_lower
+                    ),
+                    re.search(
+                        r"\bapt(?:-get)?\s+(install|upgrade|update|dist-upgrade|full-upgrade|remove|purge)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\b(dnf|yum|zypper)\s+(install|upgrade|update|remove|erase)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\bpacman\s+(-[SsRr]\b|--sync\b|--remove\b|install|upgrade|update|remove)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\bapk\s+(add|install|upgrade|update|del|delete)",
+                        command_lower,
+                    ),
+                    re.search(
+                        r"\bbrew\s+(install|upgrade|update|uninstall|remove)",
+                        command_lower,
+                    ),
+                ]
+            )
+            # Use 10 second idle timeout for package managers, 2 seconds for others
+            idle_timeout = 10.0 if is_package_manager else 2.0
+            if is_package_manager:
+                logger.info(
+                    f"Detected package manager command, using extended idle timeout of {idle_timeout}s"
+                )
+
             seen_command_echo = False
+            echo_end_pos: Optional[int] = None
             # Ensure prompt pattern exists as fallback
             self._ensure_prompt_pattern(session_key, client, shell=shell)
             consecutive_misses = 0  # Track consecutive prompt detection failures
 
+            output_limiter = OutputLimiter()
+            raw_output_chunks = []
+            
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Received chunk: {repr(chunk)}")
+                    self._feed_emulator(session_key, chunk)
                     last_recv_time = time.time()
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
-                    raw_output += limited_chunk
+                    raw_output_chunks.append(limited_chunk)
+                    
+                    # Optimization: We primarily check for prompts/input on small chunks
+                    # or after data accumulation.
+                    should_check = False
+                    if len(chunk) < 100: # Small chunks often contain prompts
+                        stripped_chunk = self._strip_ansi(chunk)
+                        if stripped_chunk and stripped_chunk.strip() and stripped_chunk.strip()[-1] in ("$", "#", ">", "%", ":", "?"):
+                            should_check = True
+                    
+                    if not should_check and (len(raw_output_chunks) % 20 == 0):
+                        should_check = True
+
+                    # ALWAYS update raw_output if we need to check echo, limit, or sentinel
+                    # to ensure we don't use stale data.
+                    if should_check or not seen_command_echo or sentinel:
+                        raw_output = "".join(raw_output_chunks)
 
                     if not seen_command_echo and "\n" in raw_output:
                         seen_command_echo = True
+                        # Record end of echo line so prompt detection only looks after it
+                        clean_snapshot = self._strip_ansi(raw_output)
+                        newline_idx = clean_snapshot.find("\n")
+                        if newline_idx != -1:
+                            echo_end_pos = newline_idx + 1
 
                     if not should_continue:
                         logger.warning("Output limit reached")
-                        return raw_output, "Output limit exceeded", 124, None
+                        return "".join(raw_output_chunks), "Output limit exceeded", 124, None, sentinel
 
-                    # Check for interactive prompts BEFORE checking for completion
-                    awaiting = self._detect_awaiting_input(raw_output, session_key)
-                    if awaiting:
-                        logger.info(f"Detected interactive prompt: {awaiting}")
-                        # Automatically handle pagers by sending 'q' to quit
-                        if awaiting == "pager":
-                            logger.info(
-                                "Automatically handling pager - sending 'q' to quit"
-                            )
+                    if should_check:
+                        # Check for interactive prompts BEFORE checking for completion
+                        awaiting = self._detect_awaiting_input(raw_output, session_key)
+                        if awaiting:
+                            # Only treat as awaiting input after a brief idle and if prompt isn't present
+                            # Exception: Pagers should be handled immediately to keep stream flowing
+                            if awaiting == "pager" or (time.time() - last_recv_time) > 0.2:
+                                clean_output = self._strip_ansi(raw_output)
+                                tail_start = echo_end_pos or 0
+                                tail_clean = clean_output[tail_start:]
+                                is_complete, _ = self._check_prompt_completion(
+                                    session_key, raw_output, tail_clean
+                                )
+                                if not is_complete:
+                                    logger.info(f"Detected interactive prompt: {awaiting}")
+                                    # Automatically handle pagers by sending 'q' to quit
+                                    if awaiting == "pager":
+                                        logger.info(
+                                            "Automatically handling pager - sending 'q' to quit"
+                                        )
 
-                            # Strip MikroTik pager prompt from output to avoid agent confusion
-                            # Match raw output as detection does
-                            raw_output = re.sub(
-                                r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
-                            )
+                                        # Strip MikroTik pager prompt from output to avoid agent confusion
+                                        # Match raw output as detection does
+                                        raw_output = re.sub(
+                                            r"--\s*\[Q quit\|D dump\|.*?\]\s*$",
+                                            "",
+                                            raw_output,
+                                        )
+                                        # Update chunks
+                                        raw_output_chunks = [raw_output]
 
-                            shell.send("q")
-                            # Continue collecting output after quitting pager
-                            time.sleep(0.3)
-                            continue
-                        # For other types of input (password, etc.), return and let agent handle
-                        return raw_output, "", 0, awaiting
+                                        shell.send("q")
+                                        # Wait for pager to exit and shell prompt to appear
+                                        # Don't just continue - actively wait for the prompt
+                                        pager_exit_start = time.time()
+                                        pager_exit_timeout = 3.0
+                                        while (
+                                            time.time() - pager_exit_start
+                                            < pager_exit_timeout
+                                        ):
+                                            time.sleep(0.1)
+                                            if shell.recv_ready():
+                                                chunk = shell.recv(4096).decode(
+                                                    "utf-8", errors="ignore"
+                                                )
+                                                logger.debug(
+                                                    f"Received chunk (pager): {repr(chunk)}"
+                                                )
+                                                self._feed_emulator(session_key, chunk)
+                                                limited_chunk, should_continue = (
+                                                    output_limiter.add_chunk(chunk)
+                                                )
+                                                raw_output_chunks.append(limited_chunk)
+                                                raw_output = "".join(raw_output_chunks)
+                                                if not should_continue:
+                                                    return (
+                                                        raw_output,
+                                                        "Output limit exceeded",
+                                                        124,
+                                                        None,
+                                                    )
+                                                # Check if we now have the shell prompt
+                                                clean_output = self._strip_ansi(raw_output)
+                                                tail_start = echo_end_pos or 0
+                                                tail_clean = clean_output[tail_start:]
+                                                is_complete, cleaned_output = (
+                                                    self._check_prompt_completion(
+                                                        session_key, raw_output, tail_clean
+                                                    )
+                                                )
+                                                if is_complete:
+                                                    logger.debug(
+                                                        "Shell prompt detected after quitting pager"
+                                                    )
+                                                    return (
+                                                        cleaned_output,
+                                                        "",
+                                                        0,
+                                                        None,
+                                                        sentinel,
+                                                    )
+                                                
+                                # For other types of input (password, etc.), return and let agent handle
+                                return self._strip_sentinel(raw_output, sentinel), "", 0, awaiting, sentinel
+
+                    # Check for sentinel (Unix shells)
+                    if sentinel and sentinel in raw_output:
+                        logger.debug("Sentinel detected")
+                        # Extract exit code and clean output
+                        clean_output = self._strip_ansi(raw_output)
+
+                        # Find sentinel and exit code
+                        # Pattern: marker + digits
+                        sentinel_pattern = re.compile(re.escape(sentinel) + r"(\d+)")
+                        match = sentinel_pattern.search(clean_output)
+                        if match:
+                            exit_code = int(match.group(1))
+
+                            # Clean up output: remove everything from sentinel onwards using the match position
+                            # This avoids truncating at the command echo which also contains the sentinel string
+
+                            # We use clean_output for truncation to ensure accurate regex index matching
+                            # match.start() is the index of the sentinel in clean_output
+                            final_output = clean_output[: match.start()]
+
+                            # We should return the clean output directly
+                            return final_output.strip(), "", exit_code, None, sentinel
 
                     # Check for command completion using captured prompt or pattern
                     # Only check after brief idle to avoid false positives from command echo
                     # AND make sure we've seen the command echo (newline)
                     if seen_command_echo and (time.time() - last_recv_time) > 0.2:
                         clean_output = self._strip_ansi(raw_output)
+                        tail_start = echo_end_pos or 0
+                        tail_clean = clean_output[tail_start:]
+
                         is_complete, cleaned_output = self._check_prompt_completion(
-                            session_key, raw_output, clean_output
+                            session_key, raw_output, tail_clean
                         )
+
+                        # If sentinel mode is on, we ignore simple prompt matching unless
+                        # we are really sure or it's been a long time?
+                        # Actually, the bug is "Cost is 10$" triggers prompt match.
+                        # If we have a sentinel, "Cost is 10$" will appear, but sentinel won't.
+                        # So we should IGNORE is_complete if sentinel is active and sentinel not found.
+                        if sentinel and is_complete:
+                            # Logic: If sentinel is used, we trust sentinel.
+                            # We DO NOT return on prompt detection alone to fix the bug.
+                            is_complete = False
                     else:
                         is_complete = False
                         cleaned_output = ""
@@ -1496,7 +2056,8 @@ class SSHSessionManager:
                                 self._session_prompts.pop(session_key, None)
                             self._capture_prompt(session_key, shell)
 
-                        return cleaned_output, "", 0, None
+                        return cleaned_output, "", 0, None, sentinel
+                            
                     else:
                         consecutive_misses += 1
 
@@ -1512,6 +2073,20 @@ class SSHSessionManager:
                                 with self._lock:
                                     self._session_prompts.pop(session_key, None)
                                     self._session_prompt_patterns.pop(session_key, None)
+
+                                # Try to clear any stuck state with Ctrl+C
+                                logger.info(
+                                    f"Sending Ctrl+C to clear stuck state for {session_key}"
+                                )
+                                try:
+                                    shell.send("\x03")
+                                    time.sleep(0.5)
+                                    # Clear any output from Ctrl+C
+                                    if shell.recv_ready():
+                                        shell.recv(4096)
+                                except Exception as e:
+                                    logger.warning(f"Error sending Ctrl+C: {e}")
+
                                 # Try to recapture prompt
                                 self._capture_prompt(session_key, shell)
                                 self._ensure_prompt_pattern(
@@ -1520,6 +2095,29 @@ class SSHSessionManager:
                                 consecutive_misses = 0
                                 logger.info(
                                     f"Recaptured prompt and regenerated pattern"
+                                )
+
+                            # Nuclear option: if we've tried many times, reset the shell
+                            if miss_count > 5:
+                                logger.error(
+                                    f"Prompt detection failed {miss_count} times for {session_key}. "
+                                    f"Shell state may be corrupted. Consider closing and recreating the session."
+                                )
+                                # Mark the shell as needing reset by closing it
+                                # The next command will create a new shell
+                                try:
+                                    shell.close()
+                                except:
+                                    pass
+                                if session_key in self._session_shells:
+                                    del self._session_shells[session_key]
+                                # Return error indicating session needs reset
+                                return (
+                                    self._strip_sentinel(raw_output, sentinel),
+                                    "Session state corrupted. The session has been reset. Please retry your command.",
+                                    1,
+                                    None,
+                                    sentinel,
                                 )
                 else:
                     # No data available - check if we should timeout from inactivity
@@ -1537,23 +2135,108 @@ class SSHSessionManager:
                                 logger.info(
                                     "Automatically handling pager during idle timeout - sending 'q' to quit"
                                 )
+
+                                # Strip MikroTik pager prompt from output to avoid agent confusion
+                                raw_output = re.sub(
+                                    r"--\s*\[Q quit\|D dump\|.*?\]\s*$", "", raw_output
+                                )
+
                                 shell.send("q")
+                                # Wait for pager to exit and shell prompt to appear
+                                pager_exit_start = time.time()
+                                pager_exit_timeout = 3.0
+                                while (
+                                    time.time() - pager_exit_start < pager_exit_timeout
+                                ):
+                                    time.sleep(0.1)
+                                    if shell.recv_ready():
+                                        chunk = shell.recv(4096).decode(
+                                            "utf-8", errors="ignore"
+                                        )
+                                        logger.debug(
+                                            f"Received chunk (idle-pager): {repr(chunk)}"
+                                        )
+                                        self._feed_emulator(session_key, chunk)
+                                        limited_chunk, should_continue = (
+                                            output_limiter.add_chunk(chunk)
+                                        )
+                                        raw_output += limited_chunk
+                                        if not should_continue:
+                                            return (
+                                                raw_output,
+                                                "Output limit exceeded",
+                                                124,
+                                                None,
+                                                sentinel,
+                                            )
+                                        # Check if we now have the shell prompt
+                                        clean_output = self._strip_ansi(raw_output)
+                                        tail_start = echo_end_pos or 0
+                                        tail_clean = clean_output[tail_start:]
+                                        is_complete, cleaned_output = (
+                                            self._check_prompt_completion(
+                                                session_key, raw_output, tail_clean
+                                            )
+                                        )
+                                        if is_complete:
+                                            logger.debug(
+                                                "Shell prompt detected after quitting pager (idle)"
+                                            )
+                                            return cleaned_output, "", 0, None, sentinel
+                                        
                                 # Reset idle timer and continue collecting
                                 last_recv_time = time.time()
-                                time.sleep(0.3)
+                                logger.debug(
+                                    "Pager quit during idle, continuing to wait for shell prompt"
+                                )
                                 continue
                             # For other types of input (password, etc.), return and let agent handle
-                            return raw_output, "", 0, awaiting
+                            # Only return awaiting input if prompt isn't already visible
+                            tail_start = echo_end_pos or 0
+                            tail_clean = clean_output[tail_start:]
+                            is_complete, _ = self._check_prompt_completion(
+                                session_key, raw_output, tail_clean
+                            )
+                            if not is_complete:
+                                return (
+                                    self._strip_sentinel(raw_output, sentinel),
+                                    "",
+                                    0,
+                                    awaiting,
+                                    sentinel,
+                                )
 
                         # Only complete on idle timeout if we detect a prompt
+                        tail_start = echo_end_pos or 0
+                        tail_clean = clean_output[tail_start:]
                         is_complete, cleaned_output = self._check_prompt_completion(
-                            session_key, raw_output, clean_output
+                            session_key, raw_output, tail_clean
                         )
                         if is_complete:
                             logger.debug(
                                 "Prompt found in cleaned output during idle timeout"
                             )
 
+                            # If sentinel is active, verify sentinel presence even on idle timeout
+                            if sentinel:
+                                if sentinel in raw_output:
+                                    # Sentinel found, we can proceed
+                                    # Logic handled in main loop, but here we are in idle block
+                                    # Let main loop handle it in next iteration (idle doesn't break loop unless we return)
+                                    pass
+                                else:
+                                    # Sentinel NOT found, but prompt found.
+                                    # This is the ambiguous case.
+                                    # If we return here, we risk the bug.
+                                    # If we don't, we risk hanging if sentinel is lost.
+                                    # Given the bug report, we MUST prioritize avoiding false positives.
+                                    # So we ignore the prompt if sentinel is missing.
+                                    logger.debug(
+                                        "Sentinel active but not found - ignoring prompt detection on idle"
+                                    )
+                                    is_complete = False
+
+                        if is_complete:
                             # If this was a context-changing command, recapture the prompt
                             if context_changing:
                                 logger.info(
@@ -1563,15 +2246,18 @@ class SSHSessionManager:
                                     self._session_prompts.pop(session_key, None)
                                 self._capture_prompt(session_key, shell)
 
-                        return cleaned_output, "", 0, None
+                            return cleaned_output, "", 0, None, sentinel
                     time.sleep(0.1)
 
             logger.warning(f"Command timed out after {timeout}s")
+            # Final join to ensure all output is returned
+            raw_output = "".join(raw_output_chunks)
             return (
-                raw_output.strip(),
+                self._strip_sentinel(raw_output, sentinel).strip(),
                 f"Command timed out after {timeout} seconds",
                 124,
                 None,
+                sentinel,
             )
 
         except Exception as exc:
@@ -1582,7 +2268,7 @@ class SSHSessionManager:
                 except Exception:
                     pass
                 del self._session_shells[session_key]
-            return "", f"Error: {exc}", 1, None
+            return "", f"Error: {exc}", 1, None, sentinel
         finally:
             with self._lock:
                 self._active_commands.pop(session_key, None)
@@ -1661,6 +2347,8 @@ class SSHSessionManager:
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode("utf-8", errors="ignore")
+                    logger.debug(f"Received chunk: {repr(chunk)}")
+                    self._feed_emulator(session_key, chunk)
                     limited_chunk, should_continue = output_limiter.add_chunk(chunk)
                     raw_output += limited_chunk
                     last_output_time = time.time()

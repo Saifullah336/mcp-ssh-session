@@ -2,6 +2,7 @@
 import os
 import re
 import tempfile
+import shlex
 from typing import Optional, Tuple
 
 
@@ -19,8 +20,6 @@ class CommandValidator:
         r'&\s*$',  # Command ending with &
         r'\bnohup\b',
         r'\bdisown\b',
-        r'\bscreen\b',
-        r'\btmux\b',
     ]
 
     # Potentially dangerous commands (optional - can be enabled/disabled)
@@ -33,7 +32,9 @@ class CommandValidator:
     ]
 
     @classmethod
-    def validate_command(cls, command: str, check_dangerous: bool = False) -> Tuple[bool, Optional[str]]:
+    def validate_command(
+        cls, command: str, check_dangerous: bool = False, pty_aware: bool = False
+    ) -> Tuple[bool, Optional[str]]:
         """
         Validate a command for safety.
 
@@ -55,6 +56,16 @@ class CommandValidator:
         for pattern in cls.BACKGROUND_PATTERNS:
             if re.search(pattern, command, re.IGNORECASE):
                 return False, f"Background process blocked: Matches pattern '{pattern}'. Background processes are not allowed."
+        if cls._contains_blocked_tmux_invocation(command, pty_aware=pty_aware):
+            return False, (
+                "Background/interactive tmux invocation blocked. "
+                "Use non-interactive file/inspection commands instead."
+            )
+        if cls._contains_blocked_screen_invocation(command, pty_aware=pty_aware):
+            return False, (
+                "Background/interactive screen invocation blocked. "
+                "Use non-interactive file/inspection commands instead."
+            )
 
         # Check for dangerous commands (optional)
         if check_dangerous:
@@ -63,6 +74,120 @@ class CommandValidator:
                     return False, f"Dangerous command blocked: Matches pattern '{pattern}'. This operation is not allowed for safety."
 
         return True, None
+
+    @classmethod
+    def _contains_blocked_tmux_invocation(
+        cls, command: str, pty_aware: bool = False
+    ) -> bool:
+        """Block only actual tmux invocations that start/attach interactive sessions.
+
+        This intentionally avoids false positives for file paths such as ~/.tmux.conf.
+        """
+        for segment in re.split(r"(?:&&|\|\||;|\|)", command):
+            tokens = cls._safe_split(segment)
+            if not tokens:
+                continue
+
+            cmd_idx = cls._find_invoked_command_index(tokens)
+            if cmd_idx is None:
+                continue
+
+            executable = tokens[cmd_idx].rsplit("/", 1)[-1].lower()
+            if executable != "tmux":
+                continue
+
+            args = [t.lower() for t in tokens[cmd_idx + 1 :]]
+            if cls._is_blocked_tmux_usage(args, strict=not pty_aware):
+                return True
+
+        return False
+
+    @classmethod
+    def _contains_blocked_screen_invocation(
+        cls, command: str, pty_aware: bool = False
+    ) -> bool:
+        for segment in re.split(r"(?:&&|\|\||;|\|)", command):
+            tokens = cls._safe_split(segment)
+            if not tokens:
+                continue
+
+            cmd_idx = cls._find_invoked_command_index(tokens)
+            if cmd_idx is None:
+                continue
+
+            executable = tokens[cmd_idx].rsplit("/", 1)[-1].lower()
+            if executable != "screen":
+                continue
+
+            args = [t.lower() for t in tokens[cmd_idx + 1 :]]
+            if cls._is_blocked_screen_usage(args, strict=not pty_aware):
+                return True
+
+        return False
+
+    @staticmethod
+    def _safe_split(command: str) -> list[str]:
+        try:
+            return shlex.split(command.strip())
+        except ValueError:
+            return command.strip().split()
+
+    @staticmethod
+    def _find_invoked_command_index(tokens: list[str]) -> Optional[int]:
+        wrappers = {"sudo", "command", "env", "builtin", "exec", "nohup"}
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                i += 1
+                continue
+            if token in wrappers:
+                i += 1
+                while i < len(tokens) and tokens[i].startswith("-"):
+                    i += 1
+                continue
+            return i
+        return None
+
+    @staticmethod
+    def _is_blocked_tmux_usage(args: list[str], strict: bool) -> bool:
+        if strict:
+            return True
+
+        # Bare tmux starts an interactive session.
+        if not args:
+            return True
+
+        subcommand = None
+        for arg in args:
+            if not arg.startswith("-"):
+                subcommand = arg
+                break
+
+        if subcommand in {"attach", "attach-session", "a"}:
+            return True
+
+        if subcommand in {"new", "new-session", "n"}:
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_blocked_screen_usage(args: list[str], strict: bool) -> bool:
+        if strict:
+            return True
+
+        # Bare screen opens an interactive terminal multiplexer.
+        if not args:
+            return True
+
+        safe_flags = {"-ls", "-list", "-wipe", "-v", "--version", "-version"}
+
+        # PTY-aware mode allows read-only discovery commands only.
+        if all(arg in safe_flags for arg in args):
+            return False
+
+        return True
 
 
 def check_permission(host: str, title: str, message: str) -> bool | str:

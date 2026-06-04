@@ -22,6 +22,8 @@ This MCP server provides tools for AI agents to:
 - **Sudo Support**: Automatic password handling for sudo commands on Unix/Linux hosts
 - **Interactive Shell Handling**: Detects and responds to password prompts automatically
 - **Command Interruption**: Allows for gracefully stopping long-running or stuck commands by sending a Ctrl+C signal to the active session
+- **Interactive PTY Mode** (v0.2.0+): Terminal emulation enabled by default for better command completion detection and interactive program support
+- **Automatic Session Recovery**: Detects and recovers from corrupted session state caused by stuck commands or pager issues
 
 ## Installation
 
@@ -202,6 +204,33 @@ Commands complete when either:
 ### MCP Server
 Built with FastMCP, exposing SSH functionality as MCP tools that can be called by AI agents.
 
+### Interactive PTY Mode (v0.2.0+)
+
+Interactive PTY mode is **enabled by default** starting with v0.2.0. This provides:
+
+- **Better command completion detection**: Uses terminal emulation to accurately detect when commands complete
+- **Interactive program support**: Better handling of vim, less, top, and other interactive programs
+- **Mode detection**: Automatically detects when running in editors, pagers, or password prompts
+- **Automatic pager handling**: Automatically quits pagers (less, more, MikroTik) by sending 'q'
+
+To disable interactive mode, set `MCP_SSH_INTERACTIVE_MODE=0`.
+
+### Session Recovery
+
+The session manager includes automatic recovery mechanisms:
+
+- **Prompt detection failure recovery**: If prompt detection fails repeatedly, the system:
+  1. Sends Ctrl+C to clear any stuck state
+  2. Recaptures the prompt
+  3. If still failing after 5 attempts, automatically resets the shell
+  
+- **Stuck command detection**: Commands running for more than 5 minutes are automatically interrupted
+
+- **Pager handling**: When a pager is detected, the system:
+  1. Sends 'q' to quit the pager
+  2. Actively waits for the shell prompt to reappear
+  3. Only returns when the command is truly complete
+
 ## Security Considerations
 
 - Uses Paramiko's `AutoAddPolicy` for host key verification (accepts new host keys automatically)
@@ -211,6 +240,57 @@ Built with FastMCP, exposing SSH functionality as MCP tools that can be called b
 - Output limited to 10MB per command to prevent memory exhaustion
 - File operations capped at 2MB for safety
 
+### Environment Variable Override System
+
+For production environments where AI agents should not have access to real credentials, you can use the environment variable override system. This allows you to:
+
+1. Use fake/alias hostnames in agent conversations (e.g., "prod-db")
+2. Store real credentials in environment variables
+3. Keep sensitive credentials out of the AI context
+
+**Environment Variable Format:**
+```
+OVRD_{alias}_{PARAM}
+```
+
+**Supported Parameters:**
+
+| Variable | Description |
+|----------|-------------|
+| `OVRD_{alias}_HOST` | Real hostname/IP address |
+| `OVRD_{alias}_PORT` | SSH port (default: 22) |
+| `OVRD_{alias}_USER` | SSH username |
+| `OVRD_{alias}_PASS` | SSH password |
+| `OVRD_{alias}_KEY` | Path to SSH private key |
+| `OVRD_{alias}_SUDO_PASS` | Sudo password |
+| `OVRD_{alias}_ENABLE_PASS` | Enable password for network devices |
+
+**Example Configuration:**
+```json
+{
+  "mcpServers": {
+    "ssh-session": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-ssh-session"],
+      "env": {
+        "OVRD_prod_db_HOST": "192.168.1.100",
+        "OVRD_prod_db_USER": "admin",
+        "OVRD_prod_db_PASS": "secret123",
+        "OVRD_prod_db_SUDO_PASS": "sudopass"
+      }
+    }
+  }
+}
+```
+
+The agent then uses the alias `prod_db` without knowing the real credentials:
+```python
+execute_command(host="prod_db", command="systemctl status postgresql")
+```
+
+This feature is fully backward compatible - if environment variables are not set, the system works normally with provided parameters.
+
 ## Dependencies
 
 - `fastmcp`: MCP server framework
@@ -219,6 +299,31 @@ Built with FastMCP, exposing SSH functionality as MCP tools that can be called b
 ## Development
 
 The project uses Python 3.10+ and is structured as a standard Python package.
+
+### Testing Workflow (Recommended)
+
+Use `uv run` for all local commands so tests work even when the virtualenv is not manually activated.
+
+```bash
+uv run pytest -q
+uv run pytest -q tests/test_bug_regressions.py
+```
+
+For integration tests:
+
+```bash
+SSH_TEST_HOST=host SSH_TEST_USER=user uv run pytest -q tests/test_integration.py
+```
+
+This repo includes `.envrc` for `direnv` users. Run `direnv allow` once.
+
+For command validation behavior in PTY mode:
+- `MCP_SSH_PTY_AWARE_VALIDATION=1` relaxes validation for read-only multiplexer inspection commands.
+- Default is strict validation (`0`).
+
+For MikroTik command behavior:
+- `MCP_SSH_MIKROTIK_AUTO_WITHOUT_PAGING=1` auto-appends `without-paging` to MikroTik `print` commands.
+- Default is enabled (`1`).
 
 ### Key Components
 

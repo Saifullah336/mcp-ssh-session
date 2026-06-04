@@ -30,7 +30,7 @@ class FileManager:
             logger.error("Remote path must be provided.")
             return "", "Remote path must be provided", 1
 
-        # Override sudo_password from env var if not provided and use_sudo is True
+        # Apply environment variable override for sudo password
         if not sudo_password and use_sudo:
             sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
 
@@ -57,12 +57,13 @@ class FileManager:
             
             logger.debug("Attempting to read file via SFTP.")
             sftp = client.open_sftp()
-            attrs = sftp.stat(remote_path)
+            resolved_path = self._resolve_sftp_path(sftp, remote_path)
+            attrs = sftp.stat(resolved_path)
             if stat.S_ISDIR(attrs.st_mode):
-                logger.error(f"Remote path is a directory: {remote_path}")
-                return "", f"Remote path is a directory: {remote_path}", 1
+                logger.error(f"Remote path is a directory: {resolved_path}")
+                return "", f"Remote path is a directory: {resolved_path}", 1
 
-            with sftp.file(remote_path, "rb") as remote_file:
+            with sftp.file(resolved_path, "rb") as remote_file:
                 data = remote_file.read(byte_limit + 1)
             logger.debug(f"Read {len(data)} bytes via SFTP.")
 
@@ -74,7 +75,7 @@ class FileManager:
             try:
                 content = data.decode(used_encoding, used_errors)
             except UnicodeDecodeError as e:
-                logger.error(f"Decode error reading file {remote_path} on {session_key}: {str(e)}")
+                logger.error(f"Decode error reading file {resolved_path} on {session_key}: {str(e)}")
                 return "", f"Failed to decode file using encoding '{used_encoding}': {str(e)}", 1
 
             stderr_msg = ""
@@ -84,7 +85,7 @@ class FileManager:
                 )
                 content += f"\n\n[CONTENT TRUNCATED after {byte_limit} bytes]"
 
-            logger.info(f"Successfully read file {remote_path} via SFTP.")
+            logger.info(f"Successfully read file {resolved_path} via SFTP.")
             return content, stderr_msg, 0
         except FileNotFoundError:
             logger.error(f"Remote file not found: {remote_path}")
@@ -162,7 +163,7 @@ class FileManager:
             logger.error("Remote path must be provided.")
             return "", "Remote path must be provided", 1
 
-        # Override sudo_password from env var if not provided and use_sudo is True
+        # Apply environment variable override for sudo password
         if not sudo_password and use_sudo:
             sudo_password = os.getenv(f"OVRD_{host}_SUDO_PASS")
 
@@ -202,22 +203,23 @@ class FileManager:
                 
                 logger.debug("Attempting to write file via SFTP.")
                 sftp = client.open_sftp()
+                resolved_path = self._resolve_sftp_path(sftp, remote_path)
 
                 if make_dirs:
-                    directory = posixpath.dirname(remote_path)
+                    directory = posixpath.dirname(resolved_path)
                     self._ensure_remote_dirs(sftp, directory)
 
                 mode = "ab" if append else "wb"
                 logger.debug(f"Opening remote file in mode '{mode}'.")
-                with sftp.file(remote_path, mode) as remote_file:
+                with sftp.file(resolved_path, mode) as remote_file:
                     remote_file.write(data)
                     remote_file.flush()
 
                 if permissions is not None:
                     logger.debug(f"Setting permissions to {oct(permissions)}.")
-                    sftp.chmod(remote_path, permissions)
+                    sftp.chmod(resolved_path, permissions)
 
-                message = f"Wrote {len(data)} bytes to {remote_path}"
+                message = f"Wrote {len(data)} bytes to {resolved_path}"
                 if append:
                     message += " (append)"
                 logger.info(f"Successfully wrote file via SFTP: {message}")
@@ -297,6 +299,15 @@ class FileManager:
             message += " (passwordless)"
         logger.info(f"Successfully wrote file via sudo: {message}")
         return message, "", 0
+
+    def _resolve_sftp_path(self, sftp: paramiko.SFTPClient, remote_path: str) -> str:
+        """Resolve SFTP path, including '~' expansion."""
+        if remote_path == "~":
+            return sftp.normalize(".")
+        if remote_path.startswith("~/"):
+            home = sftp.normalize(".")
+            return posixpath.join(home, remote_path[2:])
+        return remote_path
 
 
     def upload_or_download(self, host: str, sources: list[str], destinations: list[str], mode: str,
