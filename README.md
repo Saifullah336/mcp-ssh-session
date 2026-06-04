@@ -317,6 +317,37 @@ Then simply use:
 }
 ```
 
+#### `upload_or_download`
+
+Upload or download files between local and remote without loading them entirely into memory. Uses streaming (`tee`/`cat`) so it works with large and binary files. Supports multiple files in a single batch operation.
+
+**File attribute behavior:**
+- Existing files: content is overwritten, permissions and owner are preserved
+- New files: created with system defaults (dir: 755, file: 644)
+- `permissions` param: only applied if explicitly provided
+- Owner: never changed
+
+```json
+{
+  "host": "myserver",
+  "mode": "upload",
+  "sources": ["/local/file.txt", "/local/another.log"],
+  "destinations": ["/remote/file.txt", "/remote/another.log"],
+  "make_dirs": false,
+  "permissions": 420
+}
+```
+
+```json
+{
+  "host": "myserver",
+  "mode": "download",
+  "sources": ["/remote/file.txt"],
+  "destinations": ["/local/file.txt"],
+  "use_sudo": false
+}
+```
+
 ## Environment Variable Override System (Credential Hiding)
 
 For production environments where AI agents should not have access to real credentials, you can use environment variables to override connection parameters. This allows agents to use simple aliases while real credentials are stored securely in the MCP server configuration.
@@ -386,12 +417,21 @@ Set `SSH_ENV_FILE` to a `.env` file path to load all configuration at startup. U
 
 ## SSE Mode
 
-Set `SSE_PORT` to run as standalone HTTP server for network clients (e.g., VSCode extensions). Permission dialogs work since server runs with DISPLAY access.
+Set `SSE_PORT` to run the server as a standalone HTTP endpoint for network clients (e.g., VSCode extensions, remote agents).
+
+**Why SSE mode?** Paranoia mode uses native desktop dialogs (`xdialog`). These dialogs require access to a display session (`$DISPLAY` on Linux, native window server on macOS/Windows). If you run the MCP server in a terminal that has display access, SSE mode lets other clients connect to it over HTTP — the dialogs will still appear on the server's display.
 
 ```bash
 SSE_PORT=8000 uvx --from git+https://github.com/Saifullah336/mcp-ssh-session mcp-ssh-session
 # Connect to: http://localhost:8000/sse
 ```
+
+**Setup pattern:**
+1. Start the server in a terminal that has display access: `SSE_PORT=8000 uvx ... mcp-ssh-session`
+2. Configure your client to connect to `http://localhost:8000/sse`
+3. When paranoia mode triggers, the dialog appears on the server's display — click OK/Cancel there
+
+**Note:** The server itself must run with `$DISPLAY` set (Linux) or on a desktop session (macOS/Windows). Headless server environments without a display will not show dialogs.
 
 ## Paranoia Mode
 

@@ -65,6 +65,7 @@ class SSHSessionManager:
         ] = {}  # Track failed prompt matches for regeneration
         self._lock = threading.Lock()
         self._ssh_config = self._load_ssh_config()
+        self._original_hosts: Dict[str, str] = {}
         self._command_validator = CommandValidator()
         self._active_commands: Dict[str, Any] = {}
         self._max_completed_commands = 100  # Keep last 100 completed commands
@@ -267,6 +268,7 @@ class SSHSessionManager:
                 self.logger.warning(f"Invalid port in {env_prefix}PORT: {port_str}")
         
         session_key = f"{resolved_username}@{resolved_host}:{resolved_port}"
+        self._original_hosts[session_key] = host
         return host_config, resolved_host, resolved_username, resolved_port, session_key
     
     def _get_env_override(
@@ -564,6 +566,7 @@ class SSHSessionManager:
         self._session_shell_types.pop(session_key, None)
         self._session_prompt_patterns.pop(session_key, None)
         self._session_prompts.pop(session_key, None)
+        self._original_hosts.pop(session_key, None)
 
         # Clean up rate limits
         keys_to_remove = [
@@ -1396,7 +1399,7 @@ class SSHSessionManager:
 
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
-            host = session_key.split('@')[1].split(':')[0]
+            host = self._original_hosts[session_key]
             result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
             if result is not True:
                 return "", result, 1
@@ -1814,10 +1817,10 @@ class SSHSessionManager:
             
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
-            host = session_key.split('@')[1].split(':')[0]
+            host = self._original_hosts[session_key]
             result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
             if result is not True:
-                return "", result, 1, None
+                return "", result, 1, None, None
 
             shell.send(command_to_send + "\n")
             time.sleep(0.3)
@@ -2292,7 +2295,7 @@ class SSHSessionManager:
 
             # Ask for permission if paranoia mode is enabled
             from .validation import check_permission
-            host = session_key.split('@')[1].split(':')[0]
+            host = self._original_hosts[session_key]
             result = check_permission(host, "SSH Command Alert", f"Execute: {command} on {session_key}?")
             if result is not True:
                 return "", result, 1
